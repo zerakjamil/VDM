@@ -69,5 +69,11 @@ EOF
 echo "==> Ad-hoc signing Vortex.app..."
 codesign --force --deep --sign - "$APP_DIR"
 
+if [ -d "$DIR/../Vortex.app" ]; then
+    echo "==> Syncing build to $DIR/../Vortex.app..."
+    rm -rf "$DIR/../Vortex.app"
+    cp -R "$APP_DIR" "$DIR/../Vortex.app"
+fi
+
 echo "==> Successfully created $APP_DIR!"
 echo "You can now run 'open Vortex.app' or drag it to /Applications."

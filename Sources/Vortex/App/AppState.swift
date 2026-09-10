@@ -86,6 +86,13 @@ public final class AppState: ObservableObject {
         loadSavedDownloads()
         startDockProgressTimer()
         setupIpcServer()
+
+        AutoTurboSupervisor.shared.onRequirePauseDownloads = { [weak self] in
+            self?.pauseAll()
+        }
+        AutoTurboSupervisor.shared.onRequireResumeDownloads = { [weak self] in
+            self?.resumeAll()
+        }
     }
 
     private func setupIpcServer() {
@@ -108,6 +115,8 @@ public final class AppState: ObservableObject {
                 "activeDownloads": active,
                 "totalDownloads": self.tasks.count,
                 "globalSpeed": self.globalDownloadSpeed,
+                "autoTurboStatus": AutoTurboSupervisor.shared.statusMessage,
+                "autoTurboEnabled": AutoTurboSupervisor.shared.isEnabled,
                 "expiredDownloads": expiredList
             ]
         }
@@ -199,6 +208,29 @@ public final class AppState: ObservableObject {
                 ]
                 return try? JSONSerialization.data(withJSONObject: errObj)
             }
+        }
+
+        VortexServer.shared.onResumeTask = { [weak self] taskId in
+            self?.resumeTask(id: taskId)
+        }
+
+        VortexServer.shared.onPauseTask = { [weak self] taskId in
+            self?.pauseTask(id: taskId)
+        }
+
+        VortexServer.shared.onBoostTask = { [weak self] taskId, streams in
+            guard let self = self else { return }
+            if let idStr = taskId, let uuid = UUID(uuidString: idStr) {
+                self.tasks.first(where: { $0.id == uuid })?.boostStreams(targetCount: streams)
+            } else {
+                for task in self.tasks where task.isDownloading {
+                    task.boostStreams(targetCount: streams)
+                }
+            }
+        }
+
+        VortexServer.shared.onRecycleConnections = { [weak self] taskId in
+            self?.recycleTask(id: taskId)
         }
 
         VortexServer.shared.start()
@@ -303,10 +335,45 @@ public final class AppState: ObservableObject {
     }
 
     public func removeTask(_ task: DownloadTask, deleteFile: Bool = false) {
-        task.deleteMetadataAndFiles(deleteDownloadedFile: deleteFile)
+        var shouldDelete = deleteFile
+
+        // If incomplete download and user didn't explicitly choose to delete file, prompt if in GUI
+        if !deleteFile && task.status != .completed {
+            if NSApp.windows.contains(where: { $0.isVisible }) {
+                let alert = NSAlert()
+                let percent = Int(task.progress * 100)
+                alert.messageText = "Remove Incomplete Download?"
+                alert.informativeText = "“\(task.fileName)” is \(percent)% downloaded. Do you want to delete the temporary (.vortex) file from disk, or keep it?"
+                alert.addButton(withTitle: "Delete Partial File")
+                alert.addButton(withTitle: "Keep Partial File")
+                alert.addButton(withTitle: "Cancel")
+                alert.alertStyle = .warning
+
+                let response = alert.runModal()
+                if response == .alertFirstButtonReturn {
+                    shouldDelete = true
+                } else if response == .alertSecondButtonReturn {
+                    shouldDelete = false
+                } else {
+                    return // User cancelled
+                }
+            }
+        }
+
+        task.deleteMetadataAndFiles(deleteDownloadedFile: shouldDelete)
         tasks.removeAll(where: { $0.id == task.id })
         if selectedTask?.id == task.id {
             selectedTask = nil
+        }
+    }
+
+    public func recycleTask(id: String?) {
+        if let idStr = id, let uuid = UUID(uuidString: idStr) {
+            tasks.first(where: { $0.id == uuid })?.recycleConnections()
+        } else {
+            for task in tasks where task.isDownloading {
+                task.recycleConnections()
+            }
         }
     }
 
@@ -317,8 +384,24 @@ public final class AppState: ObservableObject {
     }
 
     public func resumeAll() {
-        for task in tasks where task.status == .paused {
+        for task in tasks where !task.isDownloading && !task.isComplete {
             task.resume()
+        }
+    }
+
+    public func resumeTask(id: String?) {
+        if let idStr = id, let uuid = UUID(uuidString: idStr) {
+            tasks.first(where: { $0.id == uuid })?.resume()
+        } else {
+            resumeAll()
+        }
+    }
+
+    public func pauseTask(id: String?) {
+        if let idStr = id, let uuid = UUID(uuidString: idStr) {
+            tasks.first(where: { $0.id == uuid })?.pause()
+        } else {
+            pauseAll()
         }
     }
 
@@ -349,6 +432,12 @@ public final class AppState: ObservableObject {
                         dockTile.badgeLabel = "\(active.count)↓"
                     }
                 }
+
+                // Supervise ISP bandwidth shaping and automated burst recovery
+                AutoTurboSupervisor.shared.tick(
+                    globalSpeedBytesPerSec: self.globalDownloadSpeed,
+                    activeDownloadsCount: active.count
+                )
             }
         }
     }

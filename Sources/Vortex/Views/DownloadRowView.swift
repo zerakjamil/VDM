@@ -56,6 +56,23 @@ public struct DownloadRowView: View {
                             .clipShape(Capsule())
                         }
 
+                        if task.isDownloading && task.supportsRange {
+                            let activeCount = task.segments.filter { !$0.isFinished }.count
+                            if activeCount > 1 {
+                                HStack(spacing: 3) {
+                                    Image(systemName: "bolt.horizontal.fill")
+                                        .font(.system(size: 8))
+                                    Text("\(activeCount) Streams")
+                                        .font(.system(size: 10, weight: .bold))
+                                }
+                                .foregroundColor(.cyan)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.cyan.opacity(0.12))
+                                .clipShape(Capsule())
+                            }
+                        }
+
                         if task.totalBytes > 0 {
                             Text("•")
                                 .foregroundColor(.secondary)
@@ -113,6 +130,35 @@ public struct DownloadRowView: View {
                         }
                         .buttonStyle(.plain)
                         .help("Manually paste renewed URL")
+                    } else if task.status.isReconnecting {
+                        Button {
+                            task.recycleConnections()
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "arrow.clockwise")
+                                Text("Retry Now")
+                            }
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundColor(.orange)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Color.orange.opacity(0.15))
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                        }
+                        .buttonStyle(.plain)
+                        .help("Attempt immediate reconnection without waiting for timer")
+
+                        Button {
+                            task.pause()
+                        } label: {
+                            Image(systemName: "pause.fill")
+                                .font(.system(size: 12))
+                                .frame(width: 28, height: 28)
+                                .background(Color.primary.opacity(0.08))
+                                .clipShape(Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .help("Pause Reconnection")
                     } else if task.isDownloading {
                         Button {
                             task.pause()
@@ -164,8 +210,14 @@ public struct DownloadRowView: View {
                                 Button("🚀 Turbo Boost to 24 Streams") {
                                     task.boostStreams(targetCount: 24)
                                 }
-                                Button("🔥 Maximum Boost to 32 Streams") {
+                                Button("🔥 Boost to 32 Streams") {
                                     task.boostStreams(targetCount: 32)
+                                }
+                                Button("⚡ Ultra Boost to 48 Streams") {
+                                    task.boostStreams(targetCount: 48)
+                                }
+                                Button("🌪️ Hyper Sonic to 64 Streams") {
+                                    task.boostStreams(targetCount: 64)
                                 }
                             }
                             Divider()
@@ -194,6 +246,12 @@ public struct DownloadRowView: View {
                         Button("Copy Download Link") {
                             NSPasteboard.general.clearContents()
                             NSPasteboard.general.setString(task.url.absoluteString, forType: .string)
+                        }
+
+                        if task.isDownloading && task.supportsRange {
+                            Button("Refresh Connections (Break Throttle)") {
+                                task.recycleConnections()
+                            }
                         }
 
                         Divider()
@@ -268,6 +326,22 @@ public struct DownloadRowView: View {
                         }
                         .foregroundColor(.secondary)
                     }
+                } else if case .reconnecting(let retryIn, let attempt) = task.status {
+                    HStack(spacing: 6) {
+                        Image(systemName: "antenna.radiowaves.left.and.right")
+                            .font(.system(size: 11))
+                            .foregroundColor(.orange)
+                        if retryIn > 0 {
+                            Text("Connection interrupted. Reconnecting in \(retryIn)s (Attempt \(attempt))...")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundColor(.orange)
+                        } else {
+                            Text("Verifying network path & sync... (Attempt \(attempt))")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundColor(.orange)
+                        }
+                    }
+                    Spacer()
                 } else if task.isComplete {
                     Text("Saved to: \(task.destinationPath)")
                         .font(.system(size: 10))
@@ -301,6 +375,17 @@ public struct DownloadRowView: View {
         )
         .onHover { isHovered = $0 }
         .contextMenu {
+            if task.isDownloading && task.supportsRange {
+                Menu("⚡ Boost Multi-Streams") {
+                    Button("⚡ Boost to 16 Streams") { task.boostStreams(targetCount: 16) }
+                    Button("🚀 Turbo Boost to 24 Streams") { task.boostStreams(targetCount: 24) }
+                    Button("🔥 Boost to 32 Streams") { task.boostStreams(targetCount: 32) }
+                    Button("⚡ Ultra Boost to 48 Streams") { task.boostStreams(targetCount: 48) }
+                    Button("🌪️ Hyper Sonic to 64 Streams") { task.boostStreams(targetCount: 64) }
+                }
+                Divider()
+            }
+
             if task.status.isExpired || !task.isComplete {
                 Button("Refresh Download Address...") {
                     appState.promptRefreshUrl(for: task)
@@ -324,6 +409,12 @@ public struct DownloadRowView: View {
             Button("Copy Download Link") {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(task.url.absoluteString, forType: .string)
+            }
+
+            if task.isDownloading && task.supportsRange {
+                Button("Refresh Connections (Break Throttle)") {
+                    task.recycleConnections()
+                }
             }
 
             Divider()

@@ -13,6 +13,9 @@ public final class StreamBalancer {
     private var timer: Timer?
     private var previousOffsets: [Int: (offset: Int64, timestamp: Date)] = [:]
     private var stalledSeconds: [Int: Int] = [:]
+    private var peakSpeed: Double = 0.0
+    private var throttledSeconds: Int = 0
+    private var lastRecycleTime: Date = .distantPast
 
     public init(task: DownloadTask) {
         self.task = task
@@ -32,6 +35,8 @@ public final class StreamBalancer {
         timer = nil
         previousOffsets.removeAll()
         stalledSeconds.removeAll()
+        peakSpeed = 0.0
+        throttledSeconds = 0
     }
 
     private func evaluateAndBalance() {
@@ -58,6 +63,27 @@ public final class StreamBalancer {
         let totalSpeed = speeds.values.reduce(0, +)
         let avgSpeed = totalSpeed / Double(speeds.count)
 
+        // Track peak speed to detect ISP / CDN quota drops (e.g. 15 MB/s dropping to 3.x MB/s)
+        if totalSpeed > peakSpeed {
+            peakSpeed = totalSpeed
+        }
+
+        // Connection-wide quota throttling detection:
+        // If speed previously reached high speeds (> 6.5 MB/s) and has now collapsed to < 3.8 MB/s
+        // for 14+ seconds, automatically recycle TCP connections to break server/ISP bandwidth shaping.
+        if peakSpeed >= 6.5 * 1024 * 1024 && totalSpeed < 3.8 * 1024 * 1024 && now.timeIntervalSince(lastRecycleTime) > 30.0 {
+            throttledSeconds += 2
+            if throttledSeconds >= 14 {
+                print("[StreamBalancer] Quota throttling detected: speed collapsed from \(String(format: "%.1f", peakSpeed / 1024 / 1024)) MB/s to \(String(format: "%.1f", totalSpeed / 1024 / 1024)) MB/s. Recycling TCP connections...")
+                throttledSeconds = 0
+                lastRecycleTime = now
+                task.recycleConnections()
+                return
+            }
+        } else if totalSpeed >= 3.8 * 1024 * 1024 {
+            throttledSeconds = 0
+        }
+
         // Detect choking: speed < 25% of average or stalled
         for seg in activeSegments {
             let speed = speeds[seg.id] ?? 0
@@ -70,8 +96,8 @@ public final class StreamBalancer {
             // If choked for 4+ seconds and has significant bytes left, trigger dynamic boost/split
             if (stalledSeconds[seg.id] ?? 0) >= 4 {
                 stalledSeconds[seg.id] = 0
-                if task.segments.count < 32 {
-                    task.boostStreams(targetCount: min(32, task.segments.count + 2))
+                if task.segments.count < 64 {
+                    task.boostStreams(targetCount: min(64, task.segments.count + 4))
                     break
                 }
             }

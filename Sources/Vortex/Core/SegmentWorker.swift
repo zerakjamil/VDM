@@ -50,6 +50,14 @@ public final class SegmentWorker: NSObject, URLSessionDataDelegate, @unchecked S
 
     private let onProgress: @Sendable (Int, Int64, Int64) -> Void // (segmentId, bytesDelta, newCurrentOffset)
     private var isCancelled = false
+    private var pendingBytesDelta: Int64 = 0
+    private var lastReportTime: CFAbsoluteTime = 0
+
+    // High-Performance Batched Disk I/O Buffer (Eliminates exFAT/APFS lock contention)
+    private var writeBuffer = Data()
+    private var writeBufferStartOffset: Int64 = -1
+    private let writeBufferThreshold = 512 * 1024 // 512 KB aligned batch
+    private let bufferLock = NSLock()
 
     public init(
         segmentId: Int,
@@ -82,6 +90,7 @@ public final class SegmentWorker: NSObject, URLSessionDataDelegate, @unchecked S
             if isCancelled { throw SegmentError.cancelled }
             do {
                 try await downloadAttempt(url: url)
+                try? flushBuffer()
                 return // Finished successfully
             } catch let err as SegmentError {
                 // If link expired, do not retry blindly: throw immediately to trigger Link Renewal!
@@ -114,7 +123,7 @@ public final class SegmentWorker: NSObject, URLSessionDataDelegate, @unchecked S
             let config = URLSessionConfiguration.ephemeral
             config.timeoutIntervalForRequest = 30.0
             config.timeoutIntervalForResource = 3600.0
-            config.httpMaximumConnectionsPerHost = 64
+            config.httpMaximumConnectionsPerHost = 128
             config.httpShouldUsePipelining = false
 
             if let proxy = self.proxyConfig {
@@ -161,10 +170,26 @@ public final class SegmentWorker: NSObject, URLSessionDataDelegate, @unchecked S
         }
     }
 
+    public func flushBuffer() throws {
+        bufferLock.lock()
+        guard !writeBuffer.isEmpty, writeBufferStartOffset >= 0 else {
+            bufferLock.unlock()
+            return
+        }
+        let dataToWrite = writeBuffer
+        let offset = writeBufferStartOffset
+        writeBuffer.removeAll(keepingCapacity: true)
+        writeBufferStartOffset = currentOffset
+        bufferLock.unlock()
+
+        try storage.write(data: dataToWrite, atOffset: offset)
+    }
+
     public func cancel() {
         isCancelled = true
         dataTask?.cancel()
         session?.invalidateAndCancel()
+        try? flushBuffer()
         if let cont = continuation {
             continuation = nil
             cont.resume(throwing: SegmentError.cancelled)
@@ -211,11 +236,53 @@ public final class SegmentWorker: NSObject, URLSessionDataDelegate, @unchecked S
     public func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         guard !isCancelled else { return }
 
+        // Strictly prevent writing past endOffset if server ignores range or streams beyond boundary
+        var writeData = data
+        if endOffset < Int64.max - 1000 {
+            let maxAllowed = max(0, endOffset - currentOffset + 1)
+            if maxAllowed <= 0 {
+                dataTask.cancel()
+                return
+            }
+            if Int64(writeData.count) > maxAllowed {
+                writeData = writeData.prefix(Int(maxAllowed))
+            }
+        }
+
         do {
-            try storage.write(data: data, atOffset: currentOffset)
-            let count = Int64(data.count)
+            let count = Int64(writeData.count)
+            var shouldFlushDirect = false
+            var flushPayload: Data? = nil
+            var flushOffset: Int64 = -1
+
+            bufferLock.lock()
+            if writeBuffer.isEmpty {
+                writeBufferStartOffset = currentOffset
+            }
+            writeBuffer.append(writeData)
             currentOffset += count
-            onProgress(segmentId, count, currentOffset)
+            pendingBytesDelta += count
+
+            if writeBuffer.count >= writeBufferThreshold {
+                flushPayload = writeBuffer
+                flushOffset = writeBufferStartOffset
+                writeBuffer.removeAll(keepingCapacity: true)
+                writeBufferStartOffset = currentOffset
+                shouldFlushDirect = true
+            }
+            bufferLock.unlock()
+
+            if shouldFlushDirect, let data = flushPayload, flushOffset >= 0 {
+                try storage.write(data: data, atOffset: flushOffset)
+            }
+
+            let now = CFAbsoluteTimeGetCurrent()
+            if (now - lastReportTime > 0.05) || pendingBytesDelta >= 256 * 1024 {
+                let delta = pendingBytesDelta
+                pendingBytesDelta = 0
+                lastReportTime = now
+                onProgress(segmentId, delta, currentOffset)
+            }
         } catch {
             continuation?.resume(throwing: error)
             continuation = nil
@@ -224,6 +291,14 @@ public final class SegmentWorker: NSObject, URLSessionDataDelegate, @unchecked S
     }
 
     public func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        try? flushBuffer()
+
+        if pendingBytesDelta > 0 {
+            let delta = pendingBytesDelta
+            pendingBytesDelta = 0
+            onProgress(segmentId, delta, currentOffset)
+        }
+
         guard let cont = continuation else { return }
         self.continuation = nil
 

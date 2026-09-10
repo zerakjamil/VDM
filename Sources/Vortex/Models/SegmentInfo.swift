@@ -40,6 +40,9 @@ public struct SegmentInfo: Identifiable, Codable, Sendable {
     }
 
     public var isFinished: Bool {
-        return currentOffset > endOffset || state == .completed
+        if endOffset >= Int64.max - 1000 {
+            return state == .completed
+        }
+        return currentOffset > endOffset
     }
 }

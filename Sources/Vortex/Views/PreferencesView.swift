@@ -14,6 +14,7 @@ public struct PreferencesView: View {
     @State private var debridService: DebridService = .realDebrid
     @State private var debridApiKey: String = ""
     @State private var maxConcurrent: Int = 2
+    @ObservedObject private var autoTurbo = AutoTurboSupervisor.shared
 
     public var body: some View {
         TabView {
@@ -156,6 +157,96 @@ public struct PreferencesView: View {
                             TorrentEngine.shared.refreshLiveTrackers()
                         }
                         .font(.system(size: 11))
+                    }
+                }
+
+                Section("⚡ Auto-Turbo ISP Burst Recovery (ZTE Smart Gateway)") {
+                    Text("Kurdistan Net / FTTH allocates a 2GB–4GB burst quota at 15 MB/s before throttling down to 3.x MB/s. Auto-Turbo automatically commands your local ZTE MT-0011 Smart Gateway to soft-restart the PPPoE session, resetting your IP and instantly unlocking a fresh 15 MB/s burst without user intervention.")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+
+                    Toggle("Enable Automated ISP Burst Quota Recovery", isOn: $autoTurbo.isEnabled)
+
+                    if autoTurbo.isEnabled {
+                        HStack(spacing: 12) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Router IP Gateway:")
+                                    .font(.system(size: 11, weight: .medium))
+                                TextField("192.168.1.1", text: $autoTurbo.routerHost)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(size: 11, design: .monospaced))
+                            }
+
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Account:")
+                                    .font(.system(size: 11, weight: .medium))
+                                TextField("user", text: $autoTurbo.routerUser)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(size: 11, design: .monospaced))
+                            }
+
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Router Password:")
+                                    .font(.system(size: 11, weight: .medium))
+                                SecureField("User-xxxx", text: $autoTurbo.routerPass)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(size: 11, design: .monospaced))
+                            }
+                        }
+
+                        HStack(spacing: 12) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Trigger When Speed Drops Below:")
+                                    .font(.system(size: 11, weight: .medium))
+                                HStack {
+                                    TextField("3.8", value: $autoTurbo.speedThresholdMBs, formatter: NumberFormatter())
+                                        .textFieldStyle(.roundedBorder)
+                                        .frame(width: 60)
+                                        .font(.system(size: 11, design: .monospaced))
+                                    Text("MB/s")
+                                        .font(.system(size: 11))
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Minimum Cooldown Between Reboots:")
+                                    .font(.system(size: 11, weight: .medium))
+                                HStack {
+                                    TextField("5", value: $autoTurbo.cooldownMinutes, formatter: NumberFormatter())
+                                        .textFieldStyle(.roundedBorder)
+                                        .frame(width: 50)
+                                        .font(.system(size: 11, design: .monospaced))
+                                    Text("minutes")
+                                        .font(.system(size: 11))
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                        }
+
+                        HStack {
+                            Circle()
+                                .fill(autoTurbo.isRebooting ? Color.orange : Color.green)
+                                .frame(width: 8, height: 8)
+                            Text("Guardian Status: \(autoTurbo.statusMessage)")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundColor(.secondary)
+
+                            Spacer()
+
+                            Button {
+                                Task {
+                                    await autoTurbo.triggerManualReboot()
+                                }
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "bolt.fill")
+                                    Text("Test Reboot Now")
+                                }
+                            }
+                            .font(.system(size: 11, weight: .semibold))
+                            .disabled(autoTurbo.isRebooting)
+                        }
                     }
                 }
             }

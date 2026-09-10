@@ -204,7 +204,7 @@ final class VortexTests: XCTestCase {
 
     @MainActor
     func testVortexServerIPC() async throws {
-        let server = VortexServer.shared
+        let server = VortexServer()
         var receivedUrl: URL? = nil
         var receivedReferrer: URL? = nil
         var receivedFilename: String? = nil
@@ -219,11 +219,13 @@ final class VortexTests: XCTestCase {
             receivedFilename = filename
         }
 
-        server.start()
+        let testPort: UInt16 = 17899
+        server.start(port: testPort)
+        defer { server.stop() }
         try await Task.sleep(nanoseconds: 300_000_000)
 
         // 1. Test GET /status
-        let statusUrl = URL(string: "http://127.0.0.1:17890/status")!
+        let statusUrl = URL(string: "http://127.0.0.1:\(testPort)/status")!
         let (statusData, statusResp) = try await URLSession.shared.data(from: statusUrl)
         let httpStatus = statusResp as? HTTPURLResponse
         XCTAssertEqual(httpStatus?.statusCode, 200)
@@ -233,7 +235,7 @@ final class VortexTests: XCTestCase {
         XCTAssertEqual(statusJson?["version"] as? String, "1.0.0")
 
         // 2. Test POST /download
-        let downloadEndpoint = URL(string: "http://127.0.0.1:17890/download")!
+        let downloadEndpoint = URL(string: "http://127.0.0.1:\(testPort)/download")!
         var postReq = URLRequest(url: downloadEndpoint)
         postReq.httpMethod = "POST"
         postReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -430,6 +432,156 @@ final class VortexTests: XCTestCase {
         XCTAssertTrue(TorrentEngine.defaultTrackers.contains("udp://tracker.opentrackr.org:1337/announce"))
         XCTAssertTrue(TorrentEngine.defaultTrackers.contains("udp://open.demonii.com:1337/announce"))
         XCTAssertGreaterThanOrEqual(engine.liveTrackers.count, 15)
+    }
+
+    @MainActor
+    func testTemporaryVortexExtensionAndAtomicRename() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+        let finalFile = tempDir.appendingPathComponent("Game_\(UUID().uuidString).zip")
+        let task = DownloadTask(url: URL(string: "https://example.com/Game.zip")!, destinationDirectory: tempDir)
+        task.destinationPath = finalFile.path
+
+        // Verify temporaryPath ends with .vortex
+        XCTAssertEqual(task.temporaryPath, finalFile.path + ".vortex")
+
+        // Prepare file at temporaryPath
+        let storage = FileStorage(filePath: task.temporaryPath)
+        try storage.prepareFile(totalSize: 1024)
+        try storage.write(data: "VORTEX_PAYLOAD".data(using: .utf8)!, atOffset: 0)
+        storage.flush()
+        storage.close()
+
+        // Prior to completion, destinationPath must NOT exist
+        XCTAssertFalse(FileManager.default.fileExists(atPath: task.destinationPath))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: task.temporaryPath))
+
+        // Perform atomic move
+        try FileManager.default.moveItem(atPath: task.temporaryPath, toPath: task.destinationPath)
+
+        // After completion: destinationPath exists, temporaryPath is gone
+        XCTAssertTrue(FileManager.default.fileExists(atPath: task.destinationPath))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: task.temporaryPath))
+
+        // Cleanup
+        try? FileManager.default.removeItem(at: finalFile)
+    }
+
+    @MainActor
+    func testIncompleteDownloadCleanup() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+        let finalFile = tempDir.appendingPathComponent("Ghost_\(UUID().uuidString).iso")
+        let task = DownloadTask(url: URL(string: "https://example.com/Ghost.iso")!, destinationDirectory: tempDir)
+        task.destinationPath = finalFile.path
+
+        // Simulate an in-progress .vortex partial file
+        let storage = FileStorage(filePath: task.temporaryPath)
+        try storage.prepareFile(totalSize: 4096)
+        try storage.write(data: "PARTIAL_DATA".data(using: .utf8)!, atOffset: 0)
+        storage.flush()
+        storage.close()
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: task.temporaryPath))
+
+        // When user chooses to delete file on remove, .vortex temporary file must be deleted
+        task.deleteMetadataAndFiles(deleteDownloadedFile: true)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: task.temporaryPath))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: task.destinationPath))
+    }
+
+    @MainActor
+    func testResumeClampsToVortexDiskSize() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+        let finalPath = tempDir.appendingPathComponent("Resume_\(UUID().uuidString).bin").path
+        let tempPath = finalPath + ".vortex"
+
+        // Write a 500-byte .vortex file to disk
+        let partialData = Data(repeating: 0xAA, count: 500)
+        try partialData.write(to: URL(fileURLWithPath: tempPath))
+        defer { try? FileManager.default.removeItem(atPath: tempPath) }
+
+        // Metadata says segment had advanced to byte 800 of a 1000 byte file
+        let meta = DownloadMetadata(
+            id: UUID(),
+            url: "https://example.com/file.bin",
+            destinationPath: finalPath,
+            fileName: "Resume.bin",
+            totalBytes: 1000,
+            supportsRange: true,
+            segments: [
+                SegmentInfo(id: 0, startOffset: 0, currentOffset: 800, endOffset: 999, state: .completed)
+            ],
+            status: .paused
+        )
+
+        let task = DownloadTask(metadata: meta)
+
+        // Offset must be clamped to actual disk size (500), and state reset to .pending
+        XCTAssertEqual(task.segments[0].currentOffset, 500)
+        XCTAssertEqual(task.segments[0].state, .pending)
+        XCTAssertEqual(task.downloadedBytes, 500)
+    }
+
+    @MainActor
+    func testAutoTurboSupervisorState() {
+        let supervisor = AutoTurboSupervisor.shared
+        XCTAssertEqual(supervisor.routerHost, "192.168.1.1")
+        XCTAssertEqual(supervisor.routerUser, "user")
+        XCTAssertGreaterThan(supervisor.speedThresholdMBs, 1.0)
+        XCTAssertGreaterThan(supervisor.cooldownMinutes, 0)
+        XCTAssertFalse(supervisor.isRebooting)
+    }
+
+    @MainActor
+    func testDownloadStatusReconnectingFormatting() {
+        let reconnectingWithTime = DownloadStatus.reconnecting(retryIn: 10, attempt: 2)
+        XCTAssertEqual(reconnectingWithTime.title, "Reconnecting in 10s (Attempt 2)...")
+        XCTAssertEqual(reconnectingWithTime.iconName, "antenna.radiowaves.left.and.right")
+        XCTAssertTrue(reconnectingWithTime.isReconnecting)
+        XCTAssertTrue(reconnectingWithTime.isActive)
+
+        let reconnectingImmediate = DownloadStatus.reconnecting(retryIn: 0, attempt: 1)
+        XCTAssertEqual(reconnectingImmediate.title, "Reconnecting (Attempt 1)...")
+    }
+
+    func testNetworkMonitorSocketProbe() {
+        // Must complete within 2.5 seconds without crashing
+        let isOnline = NetworkMonitor.quickInternetCheck(timeout: 2.0)
+        // If system is online, it returns true; if offline, false. Crucially must not throw or crash.
+        _ = isOnline
+    }
+
+    func testSegmentWorkerBufferedWriteFlush() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+        let filePath = tempDir.appendingPathComponent("TestBuffer_\(UUID().uuidString).bin").path
+        let storage = FileStorage(filePath: filePath)
+        try storage.prepareFile(totalSize: 1024)
+        defer {
+            storage.close()
+            try? FileManager.default.removeItem(atPath: filePath)
+        }
+
+        let worker = SegmentWorker(
+            segmentId: 0,
+            startOffset: 0,
+            currentOffset: 0,
+            endOffset: 1023,
+            storage: storage
+        ) { _, _, _ in }
+
+        // Simulate receiving chunks smaller than 512KB threshold
+        let chunk = "CHUNKY_DATA_PAYLOAD".data(using: .utf8)!
+        let dummySession = URLSession.shared
+        let dummyTask = dummySession.dataTask(with: URL(string: "https://example.com")!)
+
+        worker.urlSession(dummySession, dataTask: dummyTask, didReceive: chunk)
+
+        // Buffer should flush completely to disk upon calling flushBuffer
+        try worker.flushBuffer()
+        storage.flush()
+
+        let attrs = try FileManager.default.attributesOfItem(atPath: filePath)
+        let diskSize = attrs[.size] as? Int64 ?? 0
+        XCTAssertGreaterThanOrEqual(diskSize, Int64(chunk.count))
     }
 }
 

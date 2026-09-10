@@ -28,6 +28,10 @@ public final class DownloadTask: ObservableObject, Identifiable {
     public var customHeaders: [String: String]
     public let dateAdded: Date
 
+    public var temporaryPath: String {
+        return destinationPath + ".vortex"
+    }
+
     private lazy var streamBalancer = StreamBalancer(task: self)
     private var storage: FileStorage?
     private var workers: [Int: SegmentWorker] = [:]
@@ -73,17 +77,51 @@ public final class DownloadTask: ObservableObject, Identifiable {
         self.fileName = metadata.fileName
         self.totalBytes = metadata.totalBytes
         self.supportsRange = metadata.supportsRange
-        self.segments = metadata.segments
         self.customHeaders = metadata.customHeaders
         self.dateAdded = metadata.dateAdded
         self.preferredSegments = max(1, metadata.segments.count)
         self.mirrorUrls = metadata.mirrorUrls?.compactMap { URL(string: $0) } ?? []
-        self.status = metadata.status == .downloading ? .paused : metadata.status
 
-        let downloaded = metadata.segments.reduce(0) { $0 + $1.bytesDownloaded }
+        let fm = FileManager.default
+        let tempPath = metadata.destinationPath + ".vortex"
+        let finalPath = metadata.destinationPath
+
+        // Verify file presence and alignment on disk
+        if metadata.status == .completed && fm.fileExists(atPath: finalPath) {
+            self.status = .completed
+        } else if fm.fileExists(atPath: finalPath) && !fm.fileExists(atPath: tempPath) && metadata.totalBytes > 0 {
+            if let attrs = try? fm.attributesOfItem(atPath: finalPath),
+               let size = attrs[.size] as? Int64, size >= metadata.totalBytes {
+                self.status = .completed
+            } else {
+                self.status = metadata.status == .downloading ? .paused : metadata.status
+            }
+        } else {
+            self.status = metadata.status == .downloading ? .paused : metadata.status
+        }
+
+        // Align segment offsets with actual size of .vortex file on disk
+        var validatedSegments = metadata.segments
+        if fm.fileExists(atPath: tempPath), let attrs = try? fm.attributesOfItem(atPath: tempPath), let fileSize = attrs[.size] as? Int64 {
+            if fileSize < metadata.totalBytes {
+                validatedSegments = metadata.segments.map { seg in
+                    var s = seg
+                    if s.currentOffset > fileSize {
+                        s.currentOffset = max(s.startOffset, min(s.currentOffset, fileSize))
+                        if s.state == .completed && s.currentOffset <= s.endOffset {
+                            s.state = .pending
+                        }
+                    }
+                    return s
+                }
+            }
+        }
+        self.segments = validatedSegments
+
+        let downloaded = validatedSegments.reduce(0) { $0 + $1.bytesDownloaded }
         self.downloadedBytes = downloaded
         if metadata.totalBytes > 0 {
-            self.progress = Double(downloaded) / Double(metadata.totalBytes)
+            self.progress = min(1.0, Double(downloaded) / Double(metadata.totalBytes))
         }
     }
 
@@ -119,22 +157,57 @@ public final class DownloadTask: ObservableObject, Identifiable {
         SleepPreventer.shared.retainSleepAssertion(reason: "Vortex downloading \(fileName)")
         startProgressTimer()
 
+        startDownloadCoordinator()
+    }
+
+    private func startDownloadCoordinator() {
         coordinatorTask = Task { [weak self] in
             guard let self = self else { return }
-            do {
-                if self.totalBytes <= 0 || self.segments.isEmpty {
-                    try await self.probeAndInitialize()
-                }
+            var reconnectAttempt = 0
+            let maxReconnectAttempts = 60 // Can sustain long router reboots / internet outages
 
-                try await self.runDownloadSegments()
-            } catch let error as SegmentError {
-                await MainActor.run {
-                    self.handleSegmentError(error)
-                }
-            } catch {
-                await MainActor.run {
-                    self.status = .failed(error: error.localizedDescription)
-                    self.cleanupAfterStop()
+            while !Task.isCancelled {
+                do {
+                    if self.totalBytes <= 0 || self.segments.isEmpty {
+                        try await self.probeAndInitialize()
+                    }
+
+                    try await self.runDownloadSegments()
+                    // Reached complete termination!
+                    break
+                } catch let error as SegmentError {
+                    if case .cancelled = error {
+                        break // Cancelled or paused
+                    }
+                    if case .linkExpired = error {
+                        await MainActor.run {
+                            self.handleSegmentError(error)
+                        }
+                        break
+                    }
+
+                    reconnectAttempt += 1
+                    let handled = await self.handleResilientNetworkReconnect(attempt: reconnectAttempt, error: error)
+                    if !handled || reconnectAttempt >= maxReconnectAttempts {
+                        await MainActor.run {
+                            self.handleSegmentError(error)
+                        }
+                        break
+                    }
+                } catch {
+                    if (error as NSError).code == NSURLErrorCancelled {
+                        break
+                    }
+
+                    reconnectAttempt += 1
+                    let handled = await self.handleResilientNetworkReconnect(attempt: reconnectAttempt, error: error)
+                    if !handled || reconnectAttempt >= maxReconnectAttempts {
+                        await MainActor.run {
+                            self.status = .failed(error: error.localizedDescription)
+                            self.cleanupAfterStop()
+                        }
+                        break
+                    }
                 }
             }
         }
@@ -164,7 +237,7 @@ public final class DownloadTask: ObservableObject, Identifiable {
     }
 
     public func resume() {
-        guard status == .paused || status.isExpired else { return }
+        guard !isDownloading && !isComplete else { return }
         start()
     }
 
@@ -373,8 +446,8 @@ public final class DownloadTask: ObservableObject, Identifiable {
     }
 
     private func runDownloadSegments() async throws {
-        // Prepare storage with direct write
-        let fileStorage = FileStorage(filePath: destinationPath)
+        // Prepare storage with direct write to temporary .vortex file
+        let fileStorage = FileStorage(filePath: temporaryPath)
         try fileStorage.prepareFile(totalSize: totalBytes)
         self.storage = fileStorage
 
@@ -386,74 +459,99 @@ public final class DownloadTask: ObservableObject, Identifiable {
 
         let allUrls = [self.url] + self.mirrorUrls
 
-        try await withThrowingTaskGroup(of: (Int, Error?).self) { group in
-            for segment in self.segments where !segment.isFinished {
-                let assignedUrl = allUrls[segment.id % allUrls.count]
-                let useProxy = (proxyConfig != nil && (segment.id % 2 == 1))
-                let assignedProxy = useProxy ? proxyConfig : nil
+        await MainActor.run {
+            self.status = .downloading
+        }
 
-                let worker = SegmentWorker(
-                    segmentId: segment.id,
-                    startOffset: segment.startOffset,
-                    currentOffset: segment.currentOffset,
-                    endOffset: segment.endOffset,
-                    storage: fileStorage,
-                    customHeaders: self.customHeaders,
-                    proxyConfig: assignedProxy
-                ) { [weak self] (segId, bytesDelta, newOffset) in
-                    Task { @MainActor [weak self] in
-                        self?.updateProgress(segmentId: segId, bytesDelta: bytesDelta, newOffset: newOffset)
+        while !self.segments.allSatisfy({ $0.isFinished }) && !Task.isCancelled {
+            let pendingSegments = self.segments.filter { !$0.isFinished }
+            if pendingSegments.isEmpty { break }
+
+            try await withThrowingTaskGroup(of: (Int, Error?).self) { group in
+                for segment in pendingSegments {
+                    let assignedUrl = allUrls[segment.id % allUrls.count]
+                    let useProxy = (proxyConfig != nil && (segment.id % 2 == 1))
+                    let assignedProxy = useProxy ? proxyConfig : nil
+
+                    let worker = SegmentWorker(
+                        segmentId: segment.id,
+                        startOffset: segment.startOffset,
+                        currentOffset: segment.currentOffset,
+                        endOffset: segment.endOffset,
+                        storage: fileStorage,
+                        customHeaders: self.customHeaders,
+                        proxyConfig: assignedProxy
+                    ) { [weak self] (segId, bytesDelta, newOffset) in
+                        Task { @MainActor [weak self] in
+                            self?.updateProgress(segmentId: segId, bytesDelta: bytesDelta, newOffset: newOffset)
+                        }
+                    }
+
+                    self.workers[segment.id] = worker
+                    let primaryUrl = self.url
+
+                    group.addTask {
+                        do {
+                            try await worker.execute(url: assignedUrl)
+                            return (segment.id, nil)
+                        } catch {
+                            if assignedUrl != primaryUrl {
+                                do {
+                                    try await worker.execute(url: primaryUrl)
+                                    return (segment.id, nil)
+                                } catch let fallbackErr {
+                                    return (segment.id, fallbackErr)
+                                }
+                            }
+                            return (segment.id, error)
+                        }
                     }
                 }
 
-                self.workers[segment.id] = worker
-                let primaryUrl = self.url
-
-                group.addTask {
-                    do {
-                        try await worker.execute(url: assignedUrl)
-                        return (segment.id, nil)
-                    } catch {
-                        // If mirror fails, seamlessly fallback to primary URL
-                        if assignedUrl != primaryUrl {
-                            do {
-                                try await worker.execute(url: primaryUrl)
-                                return (segment.id, nil)
-                            } catch let fallbackErr {
-                                return (segment.id, fallbackErr)
+                for try await (segId, error) in group {
+                    if let error = error {
+                        throw error
+                    }
+                    await MainActor.run {
+                        if let index = self.segments.firstIndex(where: { $0.id == segId }) {
+                            if self.segments[index].currentOffset > self.segments[index].endOffset || self.segments[index].endOffset >= Int64.max - 1000 {
+                                self.segments[index].state = .completed
                             }
                         }
-                        return (segment.id, error)
+                        self.workers.removeValue(forKey: segId)
                     }
-                }
-            }
-
-            for try await (segId, error) in group {
-                if let error = error {
-                    throw error
-                }
-                await MainActor.run {
-                    if let index = self.segments.firstIndex(where: { $0.id == segId }) {
-                        if self.segments[index].currentOffset > self.segments[index].endOffset || self.segments[index].endOffset >= Int64.max - 1000 {
-                            self.segments[index].state = .completed
-                        }
-                    }
-                    self.workers.removeValue(forKey: segId)
-                    self.checkDynamicSplit()
                 }
             }
         }
 
-        // Verify all segments are truly completed
+        // Final verification: strictly ensure every segment reached its endOffset
         let allFinished = segments.allSatisfy { $0.isFinished }
         guard allFinished else {
             throw SegmentError.networkError("Download ended prematurely: not all segments finished")
         }
 
-        // All segments finished!
+        // All segments finished! Flush & close storage
         storage?.flush()
         storage?.close()
         storage = nil
+
+        // Atomic finalization: move .vortex -> destinationPath
+        let fm = FileManager.default
+        let tempPath = temporaryPath
+        let destPath = destinationPath
+
+        if fm.fileExists(atPath: tempPath) {
+            if fm.fileExists(atPath: destPath) {
+                try? fm.removeItem(atPath: destPath)
+            }
+            do {
+                try fm.moveItem(atPath: tempPath, toPath: destPath)
+            } catch {
+                if Darwin.rename(tempPath, destPath) != 0 {
+                    throw NSError(domain: "VortexError", code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "Failed to finalize downloaded file: \(error.localizedDescription)"])
+                }
+            }
+        }
 
         if totalBytes <= 0 {
             totalBytes = downloadedBytes
@@ -466,9 +564,8 @@ public final class DownloadTask: ObservableObject, Identifiable {
 
     /// Dynamic splitting: if a worker finished early and another has > 40MB remaining, split it!
     private func checkDynamicSplit() {
-        guard supportsRange, status == .downloading else { return }
+        guard supportsRange, (status == .downloading || status == .connecting) else { return }
 
-        // Find largest remaining segment that is active
         guard let largestIndex = segments.enumerated()
             .filter({ !$0.element.isFinished && $0.element.remainingBytes > 40 * 1024 * 1024 })
             .max(by: { $0.element.remainingBytes < $1.element.remainingBytes })?.offset else {
@@ -479,7 +576,6 @@ public final class DownloadTask: ObservableObject, Identifiable {
         let mid = largest.currentOffset + (largest.remainingBytes / 2)
         guard mid < largest.endOffset - (5 * 1024 * 1024) else { return }
 
-        // Stop current worker for largest, split into two
         if let worker = workers[largest.id] {
             worker.cancel()
             workers.removeValue(forKey: largest.id)
@@ -491,55 +587,27 @@ public final class DownloadTask: ObservableObject, Identifiable {
 
         segments[largestIndex] = updatedOriginal
         segments.append(newSegment)
-
-        // Launch workers for both halves
-        guard let fileStorage = storage else { return }
-
-        for seg in [updatedOriginal, newSegment] {
-            let worker = SegmentWorker(
-                segmentId: seg.id,
-                startOffset: seg.startOffset,
-                currentOffset: seg.currentOffset,
-                endOffset: seg.endOffset,
-                storage: fileStorage,
-                customHeaders: self.customHeaders
-            ) { [weak self] (segId, bytesDelta, newOffset) in
-                Task { @MainActor [weak self] in
-                    self?.updateProgress(segmentId: segId, bytesDelta: bytesDelta, newOffset: newOffset)
-                }
-            }
-            workers[seg.id] = worker
-            let allUrls = [self.url] + self.mirrorUrls
-            let assignedUrl = allUrls[seg.id % allUrls.count]
-            let primaryUrl = self.url
-            Task {
-                do {
-                    try await worker.execute(url: assignedUrl)
-                } catch {
-                    if assignedUrl != primaryUrl {
-                        try? await worker.execute(url: primaryUrl)
-                    }
-                }
-            }
-        }
+        saveMetadata()
+        recycleConnections()
     }
 
-    /// On-the-fly stream booster: multiply active connections up to targetCount (16x / 24x / 32x)
-    public func boostStreams(targetCount: Int = 24) {
+    /// On-the-fly stream booster: multiply active connections up to targetCount (16x / 24x / 32x / 48x / 64x)
+    public func boostStreams(targetCount: Int = 48) {
         guard supportsRange, totalBytes > 10 * 1024 * 1024, isDownloading else { return }
 
         var iterations = 0
-        while segments.filter({ !$0.isFinished }).count < targetCount && iterations < 32 {
+        var didSplit = false
+        while segments.filter({ !$0.isFinished }).count < targetCount && iterations < 64 {
             iterations += 1
             guard let largestIndex = segments.enumerated()
-                .filter({ !$0.element.isFinished && $0.element.remainingBytes > 10 * 1024 * 1024 })
+                .filter({ !$0.element.isFinished && $0.element.remainingBytes > 4 * 1024 * 1024 })
                 .max(by: { $0.element.remainingBytes < $1.element.remainingBytes })?.offset else {
                 break
             }
 
             let largest = segments[largestIndex]
             let mid = largest.currentOffset + (largest.remainingBytes / 2)
-            guard mid < largest.endOffset - (2 * 1024 * 1024) else { break }
+            guard mid < largest.endOffset - (1024 * 1024) else { break }
 
             if let worker = workers[largest.id] {
                 worker.cancel()
@@ -552,38 +620,119 @@ public final class DownloadTask: ObservableObject, Identifiable {
 
             segments[largestIndex] = updatedOriginal
             segments.append(newSegment)
+            didSplit = true
+        }
 
-            guard let fileStorage = storage else { continue }
-            for seg in [updatedOriginal, newSegment] {
-                let worker = SegmentWorker(
-                    segmentId: seg.id,
-                    startOffset: seg.startOffset,
-                    currentOffset: seg.currentOffset,
-                    endOffset: seg.endOffset,
-                    storage: fileStorage,
-                    customHeaders: self.customHeaders
-                ) { [weak self] (segId, bytesDelta, newOffset) in
-                    Task { @MainActor [weak self] in
-                        self?.updateProgress(segmentId: segId, bytesDelta: bytesDelta, newOffset: newOffset)
-                    }
-                }
-                workers[seg.id] = worker
-                let allUrls = [self.url] + self.mirrorUrls
-                let assignedUrl = allUrls[seg.id % allUrls.count]
-                let primaryUrl = self.url
-                Task {
-                    do {
-                        try await worker.execute(url: assignedUrl)
-                    } catch {
-                        if assignedUrl != primaryUrl {
-                            try? await worker.execute(url: primaryUrl)
-                        }
-                    }
-                }
+        if didSplit {
+            preferredSegments = segments.count
+            saveMetadata()
+            recycleConnections()
+        }
+    }
+
+    /// Connection recycler: smoothly reconnects active TCP streams with fresh sockets
+    /// when host or ISP bandwidth shaping chokes throughput from 15 MB/s down to 3 MB/s.
+    public func recycleConnections() {
+        guard isDownloading, supportsRange else { return }
+
+        coordinatorTask?.cancel()
+        for (_, worker) in workers {
+            worker.cancel()
+        }
+        workers.removeAll()
+        storage?.flush()
+
+        startDownloadCoordinator()
+    }
+
+    // MARK: - Resilient Network Supervision
+
+    private func isTransientNetworkError(_ error: Error) -> Bool {
+        if let segErr = error as? SegmentError {
+            switch segErr {
+            case .linkExpired, .serverDoesNotSupportRange, .cancelled:
+                return false
+            case .networkError, .invalidResponse:
+                return true
             }
         }
-        preferredSegments = segments.count
-        saveMetadata()
+        let nsErr = error as NSError
+        if nsErr.domain == NSURLErrorDomain {
+            switch nsErr.code {
+            case NSURLErrorNotConnectedToInternet,
+                 NSURLErrorNetworkConnectionLost,
+                 NSURLErrorTimedOut,
+                 NSURLErrorCannotConnectToHost,
+                 NSURLErrorDNSLookupFailed,
+                 NSURLErrorResourceUnavailable:
+                return true
+            case NSURLErrorCancelled:
+                return false
+            default:
+                break
+            }
+        }
+        let desc = error.localizedDescription.lowercased()
+        if desc.contains("connection closed") ||
+           desc.contains("connection reset") ||
+           desc.contains("network connection was lost") ||
+           desc.contains("offline") ||
+           desc.contains("timed out") ||
+           desc.contains("could not connect") {
+            return true
+        }
+        return false
+    }
+
+    private func handleResilientNetworkReconnect(attempt: Int, error: Error) async -> Bool {
+        guard isTransientNetworkError(error) else { return false }
+        guard status != .paused && !isComplete else { return false }
+
+        // Determine backoff duration (seconds): 4s, 7s, 10s, 13s, up to 30s
+        let delaySeconds = min(30, 4 + (attempt * 3))
+
+        // Step 1: Cleanly cancel active workers & flush memory buffers
+        for (_, worker) in workers {
+            worker.cancel()
+        }
+        workers.removeAll()
+        storage?.flush()
+
+        // Step 2: Countdown in UI with live status updates
+        for remaining in stride(from: delaySeconds, through: 1, by: -1) {
+            guard status != .paused && !isComplete && !Task.isCancelled else { return false }
+            await MainActor.run {
+                self.status = .reconnecting(retryIn: remaining, attempt: attempt)
+            }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+
+            // If internet is already confirmed online after initial wait, can proceed
+            if remaining <= delaySeconds - 3 && NetworkMonitor.quickInternetCheck(timeout: 1.0) {
+                break
+            }
+        }
+
+        // Step 3: Verify internet reachability (wait up to 90s for router power cycle)
+        var waitTicks = 0
+        while waitTicks < 90 {
+            guard status != .paused && !isComplete && !Task.isCancelled else { return false }
+            if NetworkMonitor.quickInternetCheck(timeout: 1.5) {
+                break
+            }
+            waitTicks += 1
+            await MainActor.run {
+                self.status = .reconnecting(retryIn: 0, attempt: attempt)
+            }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+
+        // Stabilization pause (allow DNS / ARP tables to settle)
+        try? await Task.sleep(nanoseconds: 1_500_000_000)
+
+        await MainActor.run {
+            self.status = .downloading
+        }
+        return true
     }
 
     private func updateProgress(segmentId: Int, bytesDelta: Int64, newOffset: Int64) {
@@ -596,7 +745,9 @@ public final class DownloadTask: ObservableObject, Identifiable {
             }
         }
 
-        downloadedBytes += bytesDelta
+        // Compute strictly from unique on-disk segment boundaries to prevent network retries / stream recycling from inflating downloadedBytes
+        let actualDownloaded = segments.reduce(0) { $0 + $1.bytesDownloaded }
+        downloadedBytes = (totalBytes > 0) ? min(totalBytes, actualDownloaded) : actualDownloaded
         speedTracker.record(downloadedBytes: downloadedBytes)
 
         if totalBytes > 0 {
@@ -692,6 +843,7 @@ public final class DownloadTask: ObservableObject, Identifiable {
 
         if deleteDownloadedFile {
             try? FileManager.default.removeItem(atPath: destinationPath)
+            try? FileManager.default.removeItem(atPath: temporaryPath)
         }
     }
 

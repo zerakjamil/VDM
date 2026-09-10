@@ -19,9 +19,19 @@ public struct RefreshDownloadPayload: Codable, Sendable {
     public let userAgent: String?
 }
 
+public struct TaskActionPayload: Codable, Sendable {
+    public let id: String?
+}
+
+public struct BoostPayload: Codable, Sendable {
+    public let id: String?
+    public let streams: Int?
+}
+
 public final class VortexServer: @unchecked Sendable {
     public static let shared = VortexServer()
-    public static let port: UInt16 = 17890
+    public static var port: UInt16 = 17890
+    public private(set) var activePort: UInt16 = 17890
 
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "com.vortex.server", qos: .userInitiated)
@@ -31,16 +41,21 @@ public final class VortexServer: @unchecked Sendable {
     public var onRefreshDownload: (@MainActor (String?, String?, String?, URL, String?) async -> Data?)?
     public var onCheckStatus: (@MainActor () -> [String: Any])?
     public var onListDownloads: (@MainActor () -> [[String: Any]])?
+    public var onResumeTask: (@MainActor (String?) -> Void)?
+    public var onPauseTask: (@MainActor (String?) -> Void)?
+    public var onBoostTask: (@MainActor (String?, Int) -> Void)?
+    public var onRecycleConnections: (@MainActor (String?) -> Void)?
 
-    private init() {}
+    public init() {}
 
-    public func start() {
+    public func start(port: UInt16 = VortexServer.port) {
         guard !isRunning else { return }
+        self.activePort = port
 
         do {
             let parameters = NWParameters.tcp
             parameters.allowLocalEndpointReuse = true
-            let listener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: Self.port)!)
+            let listener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: port)!)
             self.listener = listener
 
             listener.newConnectionHandler = { [weak self] connection in
@@ -250,6 +265,39 @@ public final class VortexServer: @unchecked Sendable {
                 }
             } catch {
                 sendResponse(connection: connection, status: "400 Bad Request", body: "{\"error\":\"Failed to parse JSON payload: \(error.localizedDescription)\"}")
+            }
+
+        case ("POST", "/resume"):
+            let payload = try? JSONDecoder().decode(TaskActionPayload.self, from: body)
+            Task { @MainActor in
+                self.onResumeTask?(payload?.id)
+                let resp = "{\"success\":true,\"message\":\"Resume command processed\"}"
+                self.sendJsonResponse(connection: connection, data: Data(resp.utf8))
+            }
+
+        case ("POST", "/pause"):
+            let payload = try? JSONDecoder().decode(TaskActionPayload.self, from: body)
+            Task { @MainActor in
+                self.onPauseTask?(payload?.id)
+                let resp = "{\"success\":true,\"message\":\"Pause command processed\"}"
+                self.sendJsonResponse(connection: connection, data: Data(resp.utf8))
+            }
+
+        case ("POST", "/boost"):
+            let payload = try? JSONDecoder().decode(BoostPayload.self, from: body)
+            let streams = payload?.streams ?? 48
+            Task { @MainActor in
+                self.onBoostTask?(payload?.id, streams)
+                let resp = "{\"success\":true,\"message\":\"Boosted to \(streams) streams\"}"
+                self.sendJsonResponse(connection: connection, data: Data(resp.utf8))
+            }
+
+        case ("POST", "/recycle"):
+            let payload = try? JSONDecoder().decode(TaskActionPayload.self, from: body)
+            Task { @MainActor in
+                self.onRecycleConnections?(payload?.id)
+                let resp = "{\"success\":true,\"message\":\"Connections recycled with fresh sockets\"}"
+                self.sendJsonResponse(connection: connection, data: Data(resp.utf8))
             }
 
         default:

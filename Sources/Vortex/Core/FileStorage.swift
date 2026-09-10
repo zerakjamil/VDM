@@ -26,9 +26,12 @@ public final class FileStorage: @unchecked Sendable {
 
         // Create parent directory if needed
         let parentDir = (filePath as NSString).deletingLastPathComponent
-        try FileManager.default.createDirectory(atPath: parentDir, withIntermediateDirectories: true)
-
         var isDir: ObjCBool = false
+        if !FileManager.default.fileExists(atPath: parentDir, isDirectory: &isDir) || !isDir.boolValue {
+            try? FileManager.default.createDirectory(atPath: parentDir, withIntermediateDirectories: true)
+        }
+
+        isDir = false
         if FileManager.default.fileExists(atPath: filePath, isDirectory: &isDir), isDir.boolValue {
             throw NSError(domain: "FileStorageError", code: Int(EISDIR), userInfo: [NSLocalizedDescriptionKey: "Failed to open file: '\(filePath)' is a directory, not a file!"])
         }
@@ -42,13 +45,45 @@ public final class FileStorage: @unchecked Sendable {
 
         self.fileDescriptor = fd
 
-        // Pre-allocate space on APFS / macOS
+        // Check destination filesystem
+        var fsStat = statfs()
+        var isApfs = true
+        var isFat32 = false
+
+        if statfs(parentDir, &fsStat) == 0 {
+            let typeName = withUnsafePointer(to: &fsStat.f_fstypename) {
+                $0.withMemoryRebound(to: CChar.self, capacity: Int(MFSTYPENAMELEN)) {
+                    String(cString: $0).lowercased()
+                }
+            }
+            isApfs = (typeName == "apfs")
+            isFat32 = (typeName == "msdos")
+        }
+
+        if isFat32 && totalSize >= 4_294_967_296 {
+            Darwin.close(fd)
+            self.fileDescriptor = -1
+            throw NSError(
+                domain: "FileStorageError",
+                code: Int(EFBIG),
+                userInfo: [NSLocalizedDescriptionKey: "Destination volume is formatted as FAT32, which does not support files 4GB or larger (\(totalSize) bytes). Please use an APFS or exFAT volume."]
+            )
+        }
+
+        // Pre-allocate space safely based on filesystem capabilities
         if totalSize > 0 {
-            // ftruncate creates sparse / preallocated size instantly on APFS
             var statBuf = stat()
             if fstat(fd, &statBuf) == 0 {
                 if statBuf.st_size < off_t(totalSize) {
-                    _ = ftruncate(fd, off_t(totalSize))
+                    if isApfs {
+                        // ftruncate creates sparse / preallocated size instantly on APFS
+                        _ = ftruncate(fd, off_t(totalSize))
+                    } else if totalSize <= 50 * 1024 * 1024 {
+                        // On non-APFS (exFAT, FAT32, SMB), ftruncate causes synchronous full-disk zero-fill
+                        // which hangs the application for 10-30 minutes on large 10-25GB files.
+                        // Only truncate small files <= 50MB; for larger files, let pwrite expand dynamically.
+                        _ = ftruncate(fd, off_t(totalSize))
+                    }
                 }
             }
         }
