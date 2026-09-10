@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Vortex Download Manager</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="header">
+    <div class="brand">
+      <div class="logo-icon">⚡</div>
+      <div class="brand-text">
+        <span class="title">VORTEX</span>
+        <span class="subtitle">Download Manager</span>
+      </div>
+    </div>
+    <div id="status-badge" class="status-badge checking">Checking...</div>
+  </div>
+
+  <div class="card status-card">
+    <div class="status-info">
+      <div id="status-indicator" class="indicator-dot disconnected"></div>
+      <div class="status-texts">
+        <div id="status-title" class="status-main">Connecting to Vortex...</div>
+        <div id="status-detail" class="status-sub">Listening on 127.0.0.1:17890</div>
+      </div>
+    </div>
+    <button id="btn-launch-vortex" class="btn-sm">Launch App</button>
+  </div>
+
+  <div class="section-title">INTERCEPTION SETTINGS</div>
+
+  <div class="card toggle-card">
+    <div class="toggle-row">
+      <div class="toggle-label">
+        <strong>Catch Downloads</strong>
+        <span>Automatically capture downloads in Vortex</span>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="toggle-intercept" checked>
+        <span class="slider"></span>
+      </label>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="toggle-row">
+      <div class="toggle-label">
+        <strong>Catch All Files</strong>
+        <span>Intercept all downloads regardless of extension</span>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="toggle-all">
+        <span class="slider"></span>
+      </label>
+    </div>
+  </div>
+
+  <div class="section-title">QUICK DOWNLOAD</div>
+
+  <div class="card input-card">
+    <div class="input-group">
+      <input type="text" id="quick-url" placeholder="Paste direct download URL (https://...)">
+      <button id="btn-paste" class="btn-icon" title="Paste from clipboard">📋</button>
+    </div>
+    <button id="btn-send-download" class="btn-primary">Download with Vortex (Multi-stream)</button>
+    <div id="feedback-msg" class="feedback"></div>
+  </div>
+
+  <div class="footer">
+    <span>Vortex v1.0.0 • M2 Native Acceleration</span>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

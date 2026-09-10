@@ -1,0 +1,26 @@
+# Xcode & Swift Package Manager
+.build/
+.swiftpm/
+Packages/
+Package.pins
+Package.resolved
+*.xcodeproj
+*.xcworkspace
+
+# Built Application Bundles & Binaries
+*.app/
+*.dSYM/
+*.o
+*.swiftdeps
+*.dia
+
+# OS & Editor
+.DS_Store
+.Trash/
+*.swp
+*~
+.idea/
+.vscode/
+
+# Vortex temporary state
+*.vortex_meta

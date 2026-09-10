@@ -1,0 +1,291 @@
+:root {
+  --bg: #1e1e24;
+  --card-bg: #282830;
+  --card-border: rgba(255, 255, 255, 0.08);
+  --primary: #0091ff;
+  --primary-glow: rgba(0, 145, 255, 0.4);
+  --accent: #00e5ff;
+  --text: #f0f0f5;
+  --text-muted: #8e8e9a;
+  --success: #00e676;
+  --danger: #ff5252;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  width: 340px;
+  background-color: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 13px;
+  padding: 14px;
+  user-select: none;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.logo-icon {
+  width: 28px;
+  height: 28px;
+  background: linear-gradient(135deg, #007aff, #00e5ff);
+  border-radius: 7px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  box-shadow: 0 2px 8px var(--primary-glow);
+}
+
+.brand-text {
+  display: flex;
+  flex-direction: column;
+}
+
+.brand-text .title {
+  font-size: 14px;
+  font-weight: 800;
+  letter-spacing: 1px;
+}
+
+.brand-text .subtitle {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.status-badge {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: 12px;
+}
+
+.status-badge.connected {
+  background: rgba(0, 230, 118, 0.15);
+  color: var(--success);
+}
+
+.status-badge.disconnected {
+  background: rgba(255, 82, 82, 0.15);
+  color: var(--danger);
+}
+
+.status-badge.checking {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text-muted);
+}
+
+.card {
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  padding: 12px;
+  margin-bottom: 12px;
+}
+
+.status-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.status-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.indicator-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+
+.indicator-dot.connected {
+  background: var(--success);
+  box-shadow: 0 0 8px var(--success);
+}
+
+.indicator-dot.disconnected {
+  background: var(--danger);
+}
+
+.status-main {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.status-sub {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.section-title {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  color: var(--text-muted);
+  margin: 10px 0 6px 2px;
+}
+
+.toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 0;
+}
+
+.toggle-label {
+  display: flex;
+  flex-direction: column;
+}
+
+.toggle-label strong {
+  font-size: 12px;
+}
+
+.toggle-label span {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.divider {
+  height: 1px;
+  background: var(--card-border);
+  margin: 8px 0;
+}
+
+/* Switch Styles */
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+}
+
+.switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.slider {
+  position: absolute;
+  cursor: pointer;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background-color: #444;
+  transition: .25s;
+  border-radius: 20px;
+}
+
+.slider:before {
+  position: absolute;
+  content: "";
+  height: 14px;
+  width: 14px;
+  left: 3px;
+  bottom: 3px;
+  background-color: white;
+  transition: .25s;
+  border-radius: 50%;
+}
+
+input:checked + .slider {
+  background: linear-gradient(135deg, #007aff, #00e5ff);
+}
+
+input:checked + .slider:before {
+  transform: translateX(16px);
+}
+
+/* Input Card */
+.input-group {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.input-group input {
+  flex: 1;
+  background: #18181c;
+  border: 1px solid var(--card-border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 7px 10px;
+  font-size: 11px;
+  outline: none;
+}
+
+.input-group input:focus {
+  border-color: var(--primary);
+}
+
+.btn-icon {
+  background: #333;
+  border: none;
+  border-radius: 6px;
+  padding: 0 10px;
+  cursor: pointer;
+}
+
+.btn-sm {
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid var(--card-border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.btn-sm:hover {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+.btn-primary {
+  width: 100%;
+  background: linear-gradient(135deg, #007aff, #00c6ff);
+  border: none;
+  border-radius: 7px;
+  color: white;
+  padding: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 2px 8px var(--primary-glow);
+  transition: opacity 0.2s;
+}
+
+.btn-primary:hover {
+  opacity: 0.92;
+}
+
+.feedback {
+  font-size: 10px;
+  margin-top: 6px;
+  text-align: center;
+  min-height: 14px;
+}
+
+.footer {
+  text-align: center;
+  font-size: 9px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
