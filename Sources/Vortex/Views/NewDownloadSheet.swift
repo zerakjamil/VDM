@@ -12,6 +12,8 @@ public struct NewDownloadSheet: View {
     @State private var segments: Int = 8
     @State private var customReferer: String = ""
     @State private var customUserAgent: String = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    @State private var secondaryMirrorsText: String = ""
+    @State private var showMirrors: Bool = false
     @State private var showAdvanced: Bool = false
     @State private var errorMessage: String? = nil
 
@@ -159,6 +161,25 @@ public struct NewDownloadSheet: View {
             }
             .font(.system(size: 11))
 
+            // Multi-Source Mirrors
+            DisclosureGroup("Multi-Source Mirrors (Combine Speed Across Hosts)", isExpanded: $showMirrors) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Paste alternative mirror URLs for the same file (e.g. 1fichier, Mediafire, MegaUp). Vortex will download distinct byte ranges across all mirrors simultaneously to multiply download speed:")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+
+                    TextEditor(text: $secondaryMirrorsText)
+                        .font(.system(size: 11, design: .monospaced))
+                        .frame(height: 54)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6)
+                                .stroke(Color.primary.opacity(0.12), lineWidth: 1)
+                        )
+                }
+                .padding(.top, 4)
+            }
+            .font(.system(size: 11))
+
             if let error = errorMessage {
                 Text(error)
                     .font(.system(size: 11))
@@ -244,6 +265,11 @@ public struct NewDownloadSheet: View {
             headers["Referer"] = p.absoluteString
         }
 
+        let parsedMirrors = secondaryMirrorsText.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && $0 != cleaned }
+            .compactMap { URL(string: $0) }
+
         appState.addDownload(
             url: url,
             originalPageUrl: pageUrl,
@@ -251,6 +277,7 @@ public struct NewDownloadSheet: View {
             fileName: customFileName.isEmpty ? nil : customFileName,
             segments: segments,
             customHeaders: headers,
+            mirrorUrls: parsedMirrors,
             startImmediately: startImmediately
         )
 

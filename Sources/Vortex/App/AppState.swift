@@ -271,6 +271,7 @@ public final class AppState: ObservableObject {
         fileName: String? = nil,
         segments: Int = 16,
         customHeaders: [String: String] = [:],
+        mirrorUrls: [URL] = [],
         startImmediately: Bool = true
     ) {
         let dest = destinationDirectory ?? self.downloadDirectory
@@ -280,7 +281,8 @@ public final class AppState: ObservableObject {
             destinationDirectory: dest,
             fileName: fileName,
             preferredSegments: segments,
-            customHeaders: customHeaders
+            customHeaders: customHeaders,
+            mirrorUrls: mirrorUrls
         )
 
         task.onStatusChanged = { [weak self] t in

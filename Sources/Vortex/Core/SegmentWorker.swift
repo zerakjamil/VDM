@@ -23,6 +23,18 @@ public enum SegmentError: LocalizedError, Sendable {
     }
 }
 
+public struct ProxyConfiguration: Sendable {
+    public let host: String
+    public let port: Int
+    public let isSocks: Bool
+
+    public init(host: String, port: Int, isSocks: Bool = true) {
+        self.host = host
+        self.port = port
+        self.isSocks = isSocks
+    }
+}
+
 public final class SegmentWorker: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     public let segmentId: Int
     public let startOffset: Int64
@@ -31,6 +43,7 @@ public final class SegmentWorker: NSObject, URLSessionDataDelegate, @unchecked S
 
     private let storage: FileStorage
     private var customHeaders: [String: String]
+    private var proxyConfig: ProxyConfiguration?
     private var session: URLSession?
     private var dataTask: URLSessionDataTask?
     private var continuation: CheckedContinuation<Void, Error>?
@@ -45,6 +58,7 @@ public final class SegmentWorker: NSObject, URLSessionDataDelegate, @unchecked S
         endOffset: Int64,
         storage: FileStorage,
         customHeaders: [String: String] = [:],
+        proxyConfig: ProxyConfiguration? = nil,
         onProgress: @escaping @Sendable (Int, Int64, Int64) -> Void
     ) {
         self.segmentId = segmentId
@@ -53,6 +67,7 @@ public final class SegmentWorker: NSObject, URLSessionDataDelegate, @unchecked S
         self.endOffset = endOffset
         self.storage = storage
         self.customHeaders = customHeaders
+        self.proxyConfig = proxyConfig
         self.onProgress = onProgress
         super.init()
     }
@@ -101,6 +116,22 @@ public final class SegmentWorker: NSObject, URLSessionDataDelegate, @unchecked S
             config.timeoutIntervalForResource = 3600.0
             config.httpMaximumConnectionsPerHost = 64
             config.httpShouldUsePipelining = false
+
+            if let proxy = self.proxyConfig {
+                if proxy.isSocks {
+                    config.connectionProxyDictionary = [
+                        kCFNetworkProxiesSOCKSEnable as String: 1,
+                        kCFNetworkProxiesSOCKSProxy as String: proxy.host,
+                        kCFNetworkProxiesSOCKSPort as String: proxy.port
+                    ]
+                } else {
+                    config.connectionProxyDictionary = [
+                        kCFNetworkProxiesHTTPEnable as String: 1,
+                        kCFNetworkProxiesHTTPProxy as String: proxy.host,
+                        kCFNetworkProxiesHTTPPort as String: proxy.port
+                    ]
+                }
+            }
 
             let opQueue = OperationQueue()
             opQueue.maxConcurrentOperationCount = 1

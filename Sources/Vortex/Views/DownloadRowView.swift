@@ -6,6 +6,9 @@ public struct DownloadRowView: View {
     @EnvironmentObject var appState: AppState
 
     @State private var isHovered = false
+    @State private var showAddMirrorSheet = false
+    @State private var newMirrorInput = ""
+    @State private var mirrorError: String? = nil
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -38,6 +41,20 @@ public struct DownloadRowView: View {
                         .padding(.vertical, 2)
                         .background(task.status.statusColor.opacity(0.12))
                         .clipShape(Capsule())
+
+                        if !task.mirrorUrls.isEmpty {
+                            HStack(spacing: 3) {
+                                Image(systemName: "point.3.filled.connected.trianglepath.dotted")
+                                    .font(.system(size: 8))
+                                Text("\(task.mirrorUrls.count + 1) Mirrors")
+                                    .font(.system(size: 10, weight: .bold))
+                            }
+                            .foregroundColor(.purple)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.purple.opacity(0.12))
+                            .clipShape(Capsule())
+                        }
 
                         if task.totalBytes > 0 {
                             Text("•")
@@ -157,6 +174,14 @@ public struct DownloadRowView: View {
                         if task.status.isExpired || !task.isComplete {
                             Button("Refresh Download Address...") {
                                 appState.promptRefreshUrl(for: task)
+                            }
+                        }
+
+                        if !task.isComplete && task.supportsRange {
+                            Button("⚡ Add Mirror Link to Multiply Speed...") {
+                                newMirrorInput = ""
+                                mirrorError = nil
+                                showAddMirrorSheet = true
                             }
                         }
 
@@ -282,6 +307,14 @@ public struct DownloadRowView: View {
                 }
             }
 
+            if !task.isComplete && task.supportsRange {
+                Button("⚡ Add Mirror Link to Multiply Speed...") {
+                    newMirrorInput = ""
+                    mirrorError = nil
+                    showAddMirrorSheet = true
+                }
+            }
+
             if let original = task.originalPageUrl {
                 Button("Open Source Page in Browser") {
                     NSWorkspace.shared.open(original)
@@ -306,6 +339,58 @@ public struct DownloadRowView: View {
             } label: {
                 Text("Delete File & Remove")
             }
+        }
+        .sheet(isPresented: $showAddMirrorSheet) {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(spacing: 8) {
+                    Image(systemName: "bolt.horizontal.fill")
+                        .foregroundColor(.purple)
+                        .font(.system(size: 20))
+                    Text("Add Mirror Link")
+                        .font(.system(size: 16, weight: .bold))
+                }
+
+                Text("Paste an alternative mirror link (1fichier, Mediafire, Qiwi, etc.) for \(task.fileName). Vortex will download chunks from both mirrors simultaneously, combining their speeds:")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+
+                TextField("https://...", text: $newMirrorInput)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 11, design: .monospaced))
+
+                if let err = mirrorError {
+                    Text(err)
+                        .font(.system(size: 11))
+                        .foregroundColor(.red)
+                }
+
+                HStack {
+                    Button("Cancel") {
+                        showAddMirrorSheet = false
+                    }
+                    Spacer()
+                    Button("Add & Accelerate") {
+                        let cleaned = newMirrorInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard let url = URL(string: cleaned), url.scheme != nil else {
+                            mirrorError = "Please enter a valid HTTP/HTTPS URL."
+                            return
+                        }
+                        Task {
+                            do {
+                                try await task.addMirror(url: url)
+                                showAddMirrorSheet = false
+                            } catch {
+                                mirrorError = error.localizedDescription
+                            }
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.purple)
+                    .disabled(newMirrorInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+            .padding(20)
+            .frame(width: 460)
         }
     }
 

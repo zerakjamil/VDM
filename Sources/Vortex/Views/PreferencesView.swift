@@ -5,6 +5,11 @@ public struct PreferencesView: View {
     @AppStorage("vortex_auto_extract") private var autoExtract: Bool = true
     @AppStorage("vortex_trash_after_extract") private var trashAfterExtract: Bool = false
     @AppStorage("vortex_default_segments") private var defaultSegments: Int = 16
+    @AppStorage("vortex_auto_inject_trackers") private var autoInjectTrackers: Bool = true
+    @AppStorage("vortex_proxy_enabled") private var proxyEnabled: Bool = false
+    @AppStorage("vortex_proxy_host") private var proxyHost: String = "127.0.0.1"
+    @AppStorage("vortex_proxy_port") private var proxyPort: Int = 40000
+    @AppStorage("vortex_proxy_is_socks") private var proxyIsSocks: Bool = true
 
     @State private var debridService: DebridService = .realDebrid
     @State private var debridApiKey: String = ""
@@ -102,6 +107,63 @@ public struct PreferencesView: View {
             }
             .padding(20)
 
+            // Network & Speed Multipliers
+            Form {
+                Section("Dual-IP / Proxy Rate-Limit Bypass") {
+                    Text("Bypasses single-IP download limits (e.g. MegaUp 3.5 MB/s cap) by alternating odd and even segments between your direct connection and a secondary proxy tunnel (like Cloudflare WARP SOCKS5 or a local proxy).")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+
+                    Toggle("Enable Secondary Proxy Segment Alternation", isOn: $proxyEnabled)
+
+                    if proxyEnabled {
+                        Picker("Proxy Protocol:", selection: $proxyIsSocks) {
+                            Text("SOCKS5 (e.g. Cloudflare WARP / Tor)").tag(true)
+                            Text("HTTP Proxy").tag(false)
+                        }
+
+                        HStack {
+                            TextField("Host (e.g. 127.0.0.1)", text: $proxyHost)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 11, design: .monospaced))
+
+                            TextField("Port", value: $proxyPort, formatter: NumberFormatter())
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 80)
+                                .font(.system(size: 11, design: .monospaced))
+                        }
+
+                        Text("Tip: If you use Cloudflare WARP in proxy mode ('warp-cli set-mode proxy'), WARP listens on 127.0.0.1:40000.")
+                            .font(.system(size: 10))
+                            .foregroundColor(.cyan)
+                    }
+                }
+
+                Section("BitTorrent Peer Discovery Acceleration") {
+                    Toggle("Automatically inject live verified public trackers into magnet links", isOn: $autoInjectTrackers)
+                    Text("Auto-fetches top 25 high-speed public seed trackers from GitHub so torrents find active peers immediately without stalling at 'connecting'.")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+
+                    HStack {
+                        Image(systemName: "antenna.radiowaves.left.and.right")
+                            .foregroundColor(.green)
+                        Text("\(TorrentEngine.shared.liveTrackers.count) active public trackers ready")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(.green)
+                        Spacer()
+                        Button("Refresh Trackers Now") {
+                            TorrentEngine.shared.refreshLiveTrackers()
+                        }
+                        .font(.system(size: 11))
+                    }
+                }
+            }
+            .tabItem {
+                Label("Network & Turbo", systemImage: "network")
+            }
+            .padding(20)
+
             // Debrid Cloud Uncapper
             Form {
                 Section("Debrid Cloud Account") {
@@ -143,7 +205,7 @@ public struct PreferencesView: View {
             }
             .padding(20)
         }
-        .frame(width: 560, height: 440)
+        .frame(width: 580, height: 480)
         .onAppear {
             self.debridService = DebridResolver.shared.selectedService
             self.debridApiKey = DebridResolver.shared.apiKey

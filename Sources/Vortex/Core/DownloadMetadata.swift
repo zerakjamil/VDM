@@ -12,6 +12,7 @@ public struct DownloadMetadata: Codable, Sendable {
     public var customHeaders: [String: String]
     public var dateAdded: Date
     public var status: DownloadStatus
+    public var mirrorUrls: [String]?
 
     public init(
         id: UUID = UUID(),
@@ -24,7 +25,8 @@ public struct DownloadMetadata: Codable, Sendable {
         segments: [SegmentInfo] = [],
         customHeaders: [String: String] = [:],
         dateAdded: Date = Date(),
-        status: DownloadStatus = .queued
+        status: DownloadStatus = .queued,
+        mirrorUrls: [String]? = nil
     ) {
         self.id = id
         self.url = url
@@ -37,6 +39,7 @@ public struct DownloadMetadata: Codable, Sendable {
         self.customHeaders = customHeaders
         self.dateAdded = dateAdded
         self.status = status
+        self.mirrorUrls = mirrorUrls
     }
 
     public static var appSupportDirectory: URL {

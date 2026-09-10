@@ -13,6 +13,7 @@ public final class DownloadTask: ObservableObject, Identifiable {
     @Published public var downloadedBytes: Int64
     @Published public var supportsRange: Bool
     @Published public var segments: [SegmentInfo]
+    @Published public var mirrorUrls: [URL] = []
     @Published public var status: DownloadStatus {
         didSet {
             onStatusChanged?(self)
@@ -41,13 +42,15 @@ public final class DownloadTask: ObservableObject, Identifiable {
         destinationDirectory: URL = AppState.defaultDownloadDirectory,
         fileName: String? = nil,
         preferredSegments: Int = 16,
-        customHeaders: [String: String] = [:]
+        customHeaders: [String: String] = [:],
+        mirrorUrls: [URL] = []
     ) {
         self.id = id
         self.url = url
         self.originalPageUrl = originalPageUrl
         self.preferredSegments = preferredSegments
         self.customHeaders = customHeaders
+        self.mirrorUrls = mirrorUrls
         self.dateAdded = Date()
 
         let initialName = DownloadTask.resolveInitialFileName(fileName: fileName, url: url, originalPageUrl: originalPageUrl)
@@ -74,6 +77,7 @@ public final class DownloadTask: ObservableObject, Identifiable {
         self.customHeaders = metadata.customHeaders
         self.dateAdded = metadata.dateAdded
         self.preferredSegments = max(1, metadata.segments.count)
+        self.mirrorUrls = metadata.mirrorUrls?.compactMap { URL(string: $0) } ?? []
         self.status = metadata.status == .downloading ? .paused : metadata.status
 
         let downloaded = metadata.segments.reduce(0) { $0 + $1.bytesDownloaded }
@@ -206,6 +210,37 @@ public final class DownloadTask: ObservableObject, Identifiable {
 
         // Resume download with new URL from exact current byte offsets!
         resume()
+    }
+
+    /// Add an alternative mirror URL for multi-source speed aggregation
+    public func addMirror(url: URL) async throws {
+        guard !mirrorUrls.contains(url) && url != self.url else { return }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "HEAD"
+        if customHeaders["User-Agent"] == nil {
+            request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
+        }
+        for (k, v) in customHeaders {
+            request.setValue(v, forHTTPHeaderField: k)
+        }
+
+        let (_, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw NSError(domain: "Vortex", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid response from mirror server"])
+        }
+
+        guard http.statusCode == 200 || http.statusCode == 206 else {
+            throw NSError(domain: "Vortex", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "Mirror returned HTTP \(http.statusCode)"])
+        }
+
+        let mirrorLength = http.expectedContentLength
+        if totalBytes > 0 && mirrorLength > 0 && mirrorLength != totalBytes {
+            throw NSError(domain: "Vortex", code: -2, userInfo: [NSLocalizedDescriptionKey: "Mirror file size mismatch! Expected \(SpeedTracker.formatBytes(totalBytes)) but mirror has \(SpeedTracker.formatBytes(mirrorLength)). Mirrors must host identical files."])
+        }
+
+        self.mirrorUrls.append(url)
+        saveMetadata()
     }
 
     // MARK: - Internal Engine
@@ -343,17 +378,28 @@ public final class DownloadTask: ObservableObject, Identifiable {
         try fileStorage.prepareFile(totalSize: totalBytes)
         self.storage = fileStorage
 
-        self.status = .downloading
+        let proxyEnabled = UserDefaults.standard.bool(forKey: "vortex_proxy_enabled")
+        let proxyHost = UserDefaults.standard.string(forKey: "vortex_proxy_host") ?? "127.0.0.1"
+        let proxyPort = UserDefaults.standard.integer(forKey: "vortex_proxy_port")
+        let proxyIsSocks = UserDefaults.standard.bool(forKey: "vortex_proxy_is_socks")
+        let proxyConfig = (proxyEnabled && proxyPort > 0) ? ProxyConfiguration(host: proxyHost, port: proxyPort, isSocks: proxyIsSocks) : nil
+
+        let allUrls = [self.url] + self.mirrorUrls
 
         try await withThrowingTaskGroup(of: (Int, Error?).self) { group in
             for segment in self.segments where !segment.isFinished {
+                let assignedUrl = allUrls[segment.id % allUrls.count]
+                let useProxy = (proxyConfig != nil && (segment.id % 2 == 1))
+                let assignedProxy = useProxy ? proxyConfig : nil
+
                 let worker = SegmentWorker(
                     segmentId: segment.id,
                     startOffset: segment.startOffset,
                     currentOffset: segment.currentOffset,
                     endOffset: segment.endOffset,
                     storage: fileStorage,
-                    customHeaders: self.customHeaders
+                    customHeaders: self.customHeaders,
+                    proxyConfig: assignedProxy
                 ) { [weak self] (segId, bytesDelta, newOffset) in
                     Task { @MainActor [weak self] in
                         self?.updateProgress(segmentId: segId, bytesDelta: bytesDelta, newOffset: newOffset)
@@ -361,13 +407,22 @@ public final class DownloadTask: ObservableObject, Identifiable {
                 }
 
                 self.workers[segment.id] = worker
-                let workerUrl = self.url
+                let primaryUrl = self.url
 
                 group.addTask {
                     do {
-                        try await worker.execute(url: workerUrl)
+                        try await worker.execute(url: assignedUrl)
                         return (segment.id, nil)
                     } catch {
+                        // If mirror fails, seamlessly fallback to primary URL
+                        if assignedUrl != primaryUrl {
+                            do {
+                                try await worker.execute(url: primaryUrl)
+                                return (segment.id, nil)
+                            } catch let fallbackErr {
+                                return (segment.id, fallbackErr)
+                            }
+                        }
                         return (segment.id, error)
                     }
                 }
@@ -454,9 +509,17 @@ public final class DownloadTask: ObservableObject, Identifiable {
                 }
             }
             workers[seg.id] = worker
-            let workerUrl = self.url
+            let allUrls = [self.url] + self.mirrorUrls
+            let assignedUrl = allUrls[seg.id % allUrls.count]
+            let primaryUrl = self.url
             Task {
-                try? await worker.execute(url: workerUrl)
+                do {
+                    try await worker.execute(url: assignedUrl)
+                } catch {
+                    if assignedUrl != primaryUrl {
+                        try? await worker.execute(url: primaryUrl)
+                    }
+                }
             }
         }
     }
@@ -505,9 +568,17 @@ public final class DownloadTask: ObservableObject, Identifiable {
                     }
                 }
                 workers[seg.id] = worker
-                let workerUrl = self.url
+                let allUrls = [self.url] + self.mirrorUrls
+                let assignedUrl = allUrls[seg.id % allUrls.count]
+                let primaryUrl = self.url
                 Task {
-                    try? await worker.execute(url: workerUrl)
+                    do {
+                        try await worker.execute(url: assignedUrl)
+                    } catch {
+                        if assignedUrl != primaryUrl {
+                            try? await worker.execute(url: primaryUrl)
+                        }
+                    }
                 }
             }
         }
@@ -591,7 +662,8 @@ public final class DownloadTask: ObservableObject, Identifiable {
             segments: segments,
             customHeaders: customHeaders,
             dateAdded: dateAdded,
-            status: status
+            status: status,
+            mirrorUrls: mirrorUrls.map { $0.absoluteString }
         )
         meta.save()
     }
@@ -609,7 +681,8 @@ public final class DownloadTask: ObservableObject, Identifiable {
             segments: segments,
             customHeaders: customHeaders,
             dateAdded: dateAdded,
-            status: status
+            status: status,
+            mirrorUrls: mirrorUrls.map { $0.absoluteString }
         )
         meta.delete()
 

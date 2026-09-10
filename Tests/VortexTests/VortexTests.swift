@@ -384,5 +384,52 @@ final class VortexTests: XCTestCase {
         // Clean up temp test dir
         try? FileManager.default.removeItem(at: tempTestDir)
     }
+
+    @MainActor
+    func testMultiSourceMirrorPersistenceAndAssignment() {
+        let primaryUrl = URL(string: "https://example.com/megaup/game.zip")!
+        let mirror1 = URL(string: "https://1fichier.com/game.zip")!
+        let mirror2 = URL(string: "https://mediafire.com/game.zip")!
+
+        let task = DownloadTask(
+            url: primaryUrl,
+            destinationDirectory: FileManager.default.temporaryDirectory,
+            mirrorUrls: [mirror1, mirror2]
+        )
+
+        XCTAssertEqual(task.mirrorUrls.count, 2)
+        XCTAssertEqual(task.mirrorUrls[0], mirror1)
+        XCTAssertEqual(task.mirrorUrls[1], mirror2)
+
+        // Test metadata persistence
+        task.saveMetadata()
+        defer { task.deleteMetadataAndFiles() }
+
+        let allMetas = DownloadMetadata.loadAll()
+        guard let savedMeta = allMetas.first(where: { $0.id == task.id }) else {
+            XCTFail("Failed to load saved metadata with mirrors")
+            return
+        }
+
+        XCTAssertEqual(savedMeta.mirrorUrls?.count, 2)
+        XCTAssertEqual(savedMeta.mirrorUrls?[0], mirror1.absoluteString)
+        XCTAssertEqual(savedMeta.mirrorUrls?[1], mirror2.absoluteString)
+
+        // Test round-robin assignment mapping
+        let allUrls = [task.url] + task.mirrorUrls
+        XCTAssertEqual(allUrls[0 % allUrls.count], primaryUrl)
+        XCTAssertEqual(allUrls[1 % allUrls.count], mirror1)
+        XCTAssertEqual(allUrls[2 % allUrls.count], mirror2)
+        XCTAssertEqual(allUrls[3 % allUrls.count], primaryUrl)
+    }
+
+    @MainActor
+    func testLiveTrackerListAndInjection() {
+        let engine = TorrentEngine.shared
+        XCTAssertFalse(TorrentEngine.defaultTrackers.isEmpty)
+        XCTAssertTrue(TorrentEngine.defaultTrackers.contains("udp://tracker.opentrackr.org:1337/announce"))
+        XCTAssertTrue(TorrentEngine.defaultTrackers.contains("udp://open.demonii.com:1337/announce"))
+        XCTAssertGreaterThanOrEqual(engine.liveTrackers.count, 15)
+    }
 }
 
