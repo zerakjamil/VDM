@@ -64,6 +64,14 @@ const handledDownloadIds = new Set();
 chrome.downloads.onCreated.addListener(async (item) => {
   if (handledDownloadIds.has(item.id)) return;
 
+  // CRITICAL: Ignore historical, completed, interrupted, or restored downloads from past sessions
+  if (item.state && item.state !== 'in_progress') return;
+  if (item.bytesReceived && item.bytesReceived > 0) return;
+  if (item.startTime) {
+    const elapsed = Date.now() - new Date(item.startTime).getTime();
+    if (elapsed > 10000 || elapsed < -10000) return; // Ignore items older than 10 seconds
+  }
+
   chrome.storage.local.get(['interceptEnabled', 'extensions', 'interceptAll'], async (settings) => {
     const downloadUrl = item.finalUrl || item.url;
     if (!downloadUrl || downloadUrl.startsWith('blob:') || downloadUrl.startsWith('data:')) return;
@@ -97,9 +105,17 @@ chrome.downloads.onCreated.addListener(async (item) => {
 
 // Also hook onDeterminingFilename for earlier interception
 chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
-  chrome.storage.local.get(['interceptEnabled', 'extensions', 'interceptAll'], async (settings) => {
-    if (handledDownloadIds.has(item.id)) return;
+  if (handledDownloadIds.has(item.id)) return;
 
+  // Ignore historical downloads
+  if (item.state && item.state !== 'in_progress') return;
+  if (item.bytesReceived && item.bytesReceived > 0) return;
+  if (item.startTime) {
+    const elapsed = Date.now() - new Date(item.startTime).getTime();
+    if (elapsed > 10000 || elapsed < -10000) return;
+  }
+
+  chrome.storage.local.get(['interceptEnabled', 'extensions', 'interceptAll'], async (settings) => {
     const downloadUrl = item.finalUrl || item.url;
     if (shouldIntercept(downloadUrl, item.filename, settings)) {
       handledDownloadIds.add(item.id);

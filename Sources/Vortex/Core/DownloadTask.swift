@@ -38,7 +38,7 @@ public final class DownloadTask: ObservableObject, Identifiable {
         id: UUID = UUID(),
         url: URL,
         originalPageUrl: URL? = nil,
-        destinationDirectory: URL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first!,
+        destinationDirectory: URL = AppState.defaultDownloadDirectory,
         fileName: String? = nil,
         preferredSegments: Int = 16,
         customHeaders: [String: String] = [:]

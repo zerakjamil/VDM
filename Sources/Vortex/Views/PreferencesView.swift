@@ -14,6 +14,65 @@ public struct PreferencesView: View {
         TabView {
             // General & Queue
             Form {
+                Section("Default Download Location") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Default folder where completed and active downloads will be saved:")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+
+                        HStack(spacing: 8) {
+                            Image(systemName: "folder.fill")
+                                .foregroundColor(.blue)
+
+                            Text(appState.downloadDirectory.path)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(.primary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 6)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(Color.primary.opacity(0.04))
+                                .clipShape(RoundedRectangle(cornerRadius: 6))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 6)
+                                        .stroke(Color.primary.opacity(0.1), lineWidth: 1)
+                                )
+
+                            Button("Change...") {
+                                let panel = NSOpenPanel()
+                                panel.title = "Select Default Download Directory"
+                                panel.prompt = "Choose"
+                                panel.canChooseFiles = false
+                                panel.canChooseDirectories = true
+                                panel.canCreateDirectories = true
+                                panel.allowsMultipleSelection = false
+                                panel.directoryURL = appState.downloadDirectory
+                                if panel.runModal() == .OK, let selectedUrl = panel.url {
+                                    appState.setDownloadDirectory(selectedUrl)
+                                }
+                            }
+                            .font(.system(size: 12))
+
+                            Button {
+                                NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: appState.downloadDirectory.path)
+                            } label: {
+                                Image(systemName: "arrow.up.forward.app")
+                            }
+                            .help("Reveal in Finder")
+
+                            if appState.downloadDirectory.path != AppState.fallbackDownloadDirectory.path {
+                                Button("Reset") {
+                                    appState.setDownloadDirectory(AppState.fallbackDownloadDirectory)
+                                }
+                                .font(.system(size: 11))
+                                .help("Reset to Vortex Downloads")
+                            }
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+
                 Section("Smart Queue & Concurrency") {
                     Picker("Max Active Downloads:", selection: $maxConcurrent) {
                         Text("1 download (Strictly Sequential)").tag(1)
@@ -84,7 +143,7 @@ public struct PreferencesView: View {
             }
             .padding(20)
         }
-        .frame(width: 520, height: 320)
+        .frame(width: 560, height: 440)
         .onAppear {
             self.debridService = DebridResolver.shared.selectedService
             self.debridApiKey = DebridResolver.shared.apiKey

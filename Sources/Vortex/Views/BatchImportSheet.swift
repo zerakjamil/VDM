@@ -5,7 +5,7 @@ public struct BatchImportSheet: View {
     @EnvironmentObject var appState: AppState
 
     @State private var rawText: String = ""
-    @State private var destinationDirectory: URL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first!
+    @State private var destinationDirectory: URL = AppState.defaultDownloadDirectory
     @State private var segments: Int = 16
     @State private var startImmediately: Bool = true
 
@@ -78,7 +78,9 @@ public struct BatchImportSheet: View {
                         let panel = NSOpenPanel()
                         panel.canChooseFiles = false
                         panel.canChooseDirectories = true
+                        panel.canCreateDirectories = true
                         panel.allowsMultipleSelection = false
+                        panel.directoryURL = destinationDirectory
                         if panel.runModal() == .OK, let url = panel.url {
                             destinationDirectory = url
                         }
@@ -125,5 +127,8 @@ public struct BatchImportSheet: View {
         }
         .padding(20)
         .frame(width: 540, height: 420)
+        .onAppear {
+            destinationDirectory = appState.downloadDirectory
+        }
     }
 }

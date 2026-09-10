@@ -39,6 +39,45 @@ public final class AppState: ObservableObject {
     @Published public var globalDownloadSpeed: Double = 0.0
     @Published public var queueManager: QueueManager!
 
+    // Download Directory
+    nonisolated public static let defaultFolderKey = "vortex_download_dir"
+
+    nonisolated public static var fallbackDownloadDirectory: URL {
+        let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first!
+        let vortexDir = downloads.appendingPathComponent("Vortex Downloads", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: vortexDir.path) {
+            try? FileManager.default.createDirectory(at: vortexDir, withIntermediateDirectories: true)
+        }
+        return vortexDir
+    }
+
+    nonisolated public static var defaultDownloadDirectory: URL {
+        get {
+            if let path = UserDefaults.standard.string(forKey: defaultFolderKey), !path.isEmpty {
+                let url = URL(fileURLWithPath: path, isDirectory: true)
+                var isDir: ObjCBool = false
+                if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) && isDir.boolValue {
+                    return url
+                }
+                if (try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)) != nil {
+                    return url
+                }
+            }
+            return fallbackDownloadDirectory
+        }
+        set {
+            UserDefaults.standard.set(newValue.path, forKey: defaultFolderKey)
+        }
+    }
+
+    @Published public var downloadDirectory: URL = AppState.defaultDownloadDirectory
+
+    public func setDownloadDirectory(_ url: URL) {
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        AppState.defaultDownloadDirectory = url
+        self.downloadDirectory = url
+    }
+
     private var dockTimer: Timer?
     private var lastClipboardString: String = ""
 
@@ -99,7 +138,7 @@ public final class AppState: ObservableObject {
 
         VortexServer.shared.onAddDownload = { [weak self] url, pageUrl, filename, headers, segments in
             guard let self = self else { return }
-            let dest = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first!
+            let dest = self.downloadDirectory
             let cleanName = (filename?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) ? nil : filename
             self.addDownload(
                 url: url,
@@ -185,7 +224,7 @@ public final class AppState: ObservableObject {
         if let ua = userAgent { headers["User-Agent"] = ua }
 
         let pageUrl = referer.flatMap { URL(string: $0) }
-        let dest = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first!
+        let dest = self.downloadDirectory
 
         addDownload(
             url: targetUrl,
@@ -228,16 +267,17 @@ public final class AppState: ObservableObject {
     public func addDownload(
         url: URL,
         originalPageUrl: URL? = nil,
-        destinationDirectory: URL,
+        destinationDirectory: URL? = nil,
         fileName: String? = nil,
         segments: Int = 16,
         customHeaders: [String: String] = [:],
         startImmediately: Bool = true
     ) {
+        let dest = destinationDirectory ?? self.downloadDirectory
         let task = DownloadTask(
             url: url,
             originalPageUrl: originalPageUrl,
-            destinationDirectory: destinationDirectory,
+            destinationDirectory: dest,
             fileName: fileName,
             preferredSegments: segments,
             customHeaders: customHeaders

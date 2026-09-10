@@ -62,7 +62,7 @@ public struct FloatingDropZoneView: View {
         showSuccessAnimation = true
         appState.addDownload(
             url: url,
-            destinationDirectory: FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first!,
+            destinationDirectory: appState.downloadDirectory,
             segments: 16,
             startImmediately: true
         )

@@ -8,7 +8,7 @@ public struct NewDownloadSheet: View {
     @State private var urlString: String = ""
     @State private var originalPageUrlString: String = ""
     @State private var customFileName: String = ""
-    @State private var saveDirectory: URL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first!
+    @State private var saveDirectory: URL = AppState.defaultDownloadDirectory
     @State private var segments: Int = 8
     @State private var customReferer: String = ""
     @State private var customUserAgent: String = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
@@ -193,6 +193,7 @@ public struct NewDownloadSheet: View {
         .padding(20)
         .frame(width: 540, height: 480)
         .onAppear {
+            saveDirectory = appState.downloadDirectory
             if let clip = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines),
                clip.starts(with: "http://") || clip.starts(with: "https://") || clip.lowercased().starts(with: "magnet:") {
                 urlString = clip
@@ -211,6 +212,7 @@ public struct NewDownloadSheet: View {
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
         panel.canCreateDirectories = true
+        panel.directoryURL = saveDirectory
         panel.prompt = "Select Folder"
 
         if panel.runModal() == .OK, let url = panel.url {

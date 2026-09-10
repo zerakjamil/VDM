@@ -359,5 +359,30 @@ final class VortexTests: XCTestCase {
         XCTAssertEqual(qm.maxConcurrentDownloads, 2)
         XCTAssertEqual(appState.tasks.filter { $0.status == .queued }.count, 3)
     }
+
+    @MainActor
+    func testDefaultDownloadDirectoryConfiguration() {
+        let original = AppState.defaultDownloadDirectory
+        defer {
+            AppState.defaultDownloadDirectory = original
+        }
+
+        // Test fallback ends with "Vortex Downloads"
+        let fallback = AppState.fallbackDownloadDirectory
+        XCTAssertTrue(fallback.path.hasSuffix("Vortex Downloads"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fallback.path))
+
+        // Test changing default directory
+        let tempTestDir = FileManager.default.temporaryDirectory.appendingPathComponent("VortexTestDownloads_\(UUID().uuidString)")
+        let appState = AppState()
+        appState.setDownloadDirectory(tempTestDir)
+
+        XCTAssertEqual(AppState.defaultDownloadDirectory.path, tempTestDir.path)
+        XCTAssertEqual(appState.downloadDirectory.path, tempTestDir.path)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: tempTestDir.path))
+
+        // Clean up temp test dir
+        try? FileManager.default.removeItem(at: tempTestDir)
+    }
 }
 
