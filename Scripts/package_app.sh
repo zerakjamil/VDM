@@ -18,6 +18,11 @@ mkdir -p "$APP_DIR/Contents/Resources"
 cp "$BIN_PATH" "$APP_DIR/Contents/MacOS/Vortex"
 chmod +x "$APP_DIR/Contents/MacOS/Vortex"
 
+if [ -f "/opt/homebrew/bin/aria2c" ]; then
+    cp "/opt/homebrew/bin/aria2c" "$APP_DIR/Contents/MacOS/aria2c"
+    chmod +x "$APP_DIR/Contents/MacOS/aria2c"
+fi
+
 cat << 'EOF' > "$APP_DIR/Contents/Info.plist"
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

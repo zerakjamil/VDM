@@ -51,13 +51,25 @@ public struct NewDownloadSheet: View {
                     .font(.system(size: 12, weight: .semibold))
 
                 HStack {
-                    TextField("https://...", text: $urlString)
+                    TextField("https://... or magnet:?xt=...", text: $urlString)
                         .textFieldStyle(.roundedBorder)
                         .font(.system(size: 12, design: .monospaced))
+                        .onChange(of: urlString) { newUrl in
+                            if newUrl.lowercased().hasPrefix("magnet:"), let meta = MagnetParser.parse(uri: newUrl) {
+                                if customFileName.isEmpty {
+                                    customFileName = meta.displayName
+                                }
+                            }
+                        }
 
                     Button {
                         if let clip = NSPasteboard.general.string(forType: .string) {
                             urlString = clip.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if urlString.lowercased().hasPrefix("magnet:"), let meta = MagnetParser.parse(uri: urlString) {
+                                if customFileName.isEmpty {
+                                    customFileName = meta.displayName
+                                }
+                            }
                         }
                     } label: {
                         HStack(spacing: 4) {
@@ -182,8 +194,13 @@ public struct NewDownloadSheet: View {
         .frame(width: 540, height: 480)
         .onAppear {
             if let clip = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines),
-               clip.starts(with: "http://") || clip.starts(with: "https://") {
+               clip.starts(with: "http://") || clip.starts(with: "https://") || clip.lowercased().starts(with: "magnet:") {
                 urlString = clip
+                if clip.lowercased().starts(with: "magnet:"), let meta = MagnetParser.parse(uri: clip) {
+                    if customFileName.isEmpty {
+                        customFileName = meta.displayName
+                    }
+                }
             }
         }
     }
@@ -203,8 +220,9 @@ public struct NewDownloadSheet: View {
 
     private func createDownload(startImmediately: Bool) {
         let cleaned = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let url = URL(string: cleaned), url.scheme != nil, url.host != nil else {
-            errorMessage = "Please enter a valid URL (starting with http:// or https://)"
+        let isMagnet = cleaned.lowercased().hasPrefix("magnet:")
+        guard let url = URL(string: cleaned), url.scheme != nil, (url.host != nil || isMagnet) else {
+            errorMessage = "Please enter a valid URL (http://, https://, or magnet:?xt=...)"
             return
         }
 

@@ -91,10 +91,24 @@ public final class DownloadTask: ObservableObject, Identifiable {
         return status == .downloading || status == .connecting
     }
 
+    public var isTorrent: Bool {
+        return url.scheme?.lowercased() == "magnet" || url.pathExtension.lowercased() == "torrent"
+    }
+
     // MARK: - Download Lifecycle
 
     public func start() {
         guard !isDownloading else { return }
+
+        if isTorrent {
+            status = .connecting
+            TorrentEngine.shared.startTorrent(
+                task: self,
+                magnetUri: url.absoluteString,
+                destinationDirectory: URL(fileURLWithPath: destinationPath).deletingLastPathComponent()
+            )
+            return
+        }
 
         status = .connecting
         streamBalancer.start()
@@ -124,6 +138,13 @@ public final class DownloadTask: ObservableObject, Identifiable {
 
     public func pause() {
         guard isDownloading else { return }
+
+        if isTorrent {
+            TorrentEngine.shared.pause(task: self)
+            saveMetadata()
+            return
+        }
+
         status = .paused
         coordinatorTask?.cancel()
         coordinatorTask = nil
@@ -549,7 +570,7 @@ public final class DownloadTask: ObservableObject, Identifiable {
         }
     }
 
-    private func cleanupAfterStop() {
+    func cleanupAfterStop() {
         streamBalancer.stop()
         progressTimer?.invalidate()
         progressTimer = nil
@@ -592,6 +613,10 @@ public final class DownloadTask: ObservableObject, Identifiable {
         )
         meta.delete()
 
+        if isTorrent {
+            TorrentEngine.shared.cancel(taskId: id)
+        }
+
         if deleteDownloadedFile {
             try? FileManager.default.removeItem(atPath: destinationPath)
         }
@@ -621,6 +646,14 @@ public final class DownloadTask: ObservableObject, Identifiable {
         if !raw.isEmpty && raw != "/" && Int(raw) == nil {
             let clean = (raw as NSString).lastPathComponent.removingPercentEncoding ?? raw
             return clean.isEmpty ? "download.bin" : clean
+        }
+
+        // Check if magnet link
+        if url.scheme?.lowercased() == "magnet" {
+            if let meta = MagnetParser.parse(uri: url.absoluteString) {
+                return meta.displayName
+            }
+            return "Torrent_\(UUID().uuidString.prefix(6))"
         }
 
         let urlLast = url.lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
