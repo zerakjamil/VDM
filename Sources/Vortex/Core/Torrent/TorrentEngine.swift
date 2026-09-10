@@ -9,12 +9,14 @@ public final class TorrentEngine: ObservableObject {
     private var processPipes: [UUID: Pipe] = [:]
 
     public static var aria2Path: String? {
-        let candidates = [
-            Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/aria2c").path,
-            "/opt/homebrew/bin/aria2c",
-            "/usr/local/bin/aria2c",
-            "/usr/bin/aria2c"
-        ]
+        var candidates: [String] = []
+        if let exe = Bundle.main.executableURL {
+            candidates.append(exe.deletingLastPathComponent().appendingPathComponent("aria2c").path)
+        }
+        candidates.append(Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/aria2c").path)
+        candidates.append("/opt/homebrew/bin/aria2c")
+        candidates.append("/usr/local/bin/aria2c")
+        candidates.append("/usr/bin/aria2c")
         return candidates.first { FileManager.default.fileExists(atPath: $0) }
     }
 
@@ -26,7 +28,7 @@ public final class TorrentEngine: ObservableObject {
         destinationDirectory: URL
     ) {
         guard let aria2 = Self.aria2Path else {
-            task.status = .failed(error: "aria2c engine not found. Please install aria2 using 'brew install aria2'.")
+            task.status = .failed(error: "aria2c engine not found. Please install aria2 via 'brew install aria2'.")
             return
         }
 
@@ -40,25 +42,41 @@ public final class TorrentEngine: ObservableObject {
             "--summary-interval=1",
             "--max-connection-per-server=16",
             "--split=16",
+            "--dht-entry-point=router.bittorrent.com:6881",
+            "--dht-entry-point=dht.transmissionbt.com:6881",
+            "--bt-tracker-connect-timeout=4",
+            "--bt-tracker-timeout=4",
             "--enable-dht=true",
+            "--enable-peer-exchange=true",
             "--bt-enable-lpd=true",
             "--bt-stop-timeout=300",
             "--file-allocation=none",
             magnetUri
         ]
 
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
 
         activeProcesses[task.id] = process
-        processPipes[task.id] = pipe
+        processPipes[task.id] = outPipe
         task.status = .connecting
 
         SleepPreventer.shared.retainSleepAssertion(reason: "Vortex torrenting \(task.fileName)")
 
-        let outHandle = pipe.fileHandleForReading
+        let outHandle = outPipe.fileHandleForReading
         outHandle.readabilityHandler = { [weak self, weak task] handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+
+            Task { @MainActor in
+                self?.parseOutput(text, task: task)
+            }
+        }
+
+        let errHandle = errPipe.fileHandleForReading
+        errHandle.readabilityHandler = { [weak self, weak task] handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
 
@@ -119,14 +137,14 @@ public final class TorrentEngine: ObservableObject {
         }
     }
 
-    /// Parses aria2 download summary lines:
-    /// [#a09d1f 250MiB/4.3GiB(5%) CN:24 DL:11.8MiB ETA:5m42s]
+    /// Parses aria2 progress output
     private func parseOutput(_ text: String, task: DownloadTask?) {
         guard let task = task else { return }
 
         let lines = text.components(separatedBy: .newlines)
         for line in lines {
-            if line.contains("(OK):download completed.") || line.contains("download completed") {
+            // Real completion: must not be metadata completion
+            if (line.contains("(OK):download completed.") || line.contains("download completed")) && !line.contains("[METADATA]") {
                 task.status = .completed
                 return
             }
@@ -148,6 +166,13 @@ public final class TorrentEngine: ObservableObject {
                 }
             }
 
+            // Handle metadata fetching phase
+            if line.contains("[METADATA]") {
+                if task.status != .connecting {
+                    task.status = .connecting
+                }
+            }
+
             // Regex for progress line:
             // [#e49689 120MiB/4.3GiB(2%) CN:16 SD:4 DL:11.5MiB/s ETA:5m]
             let pattern = #"(?i)\[#([a-f0-9]+)\s+([0-9.]+[A-Za-z]+)\/([0-9.]+[A-Za-z]+)\((\d+)%\)\s+(?:CN:(\d+))?\s*(?:SD:\d+)?\s*(?:DL:([0-9.]+[A-Za-z]+(?:\/s)?))?\s*(?:ETA:([0-9a-z]+))?\]"#
@@ -155,15 +180,18 @@ public final class TorrentEngine: ObservableObject {
             let nsLine = line as NSString
             let matches = regex.matches(in: line, range: NSRange(location: 0, length: line.utf16.count))
             if let match = matches.first {
-                if task.status != .downloading {
-                    task.status = .downloading
-                }
-
                 let downloadedStr = match.range(at: 2).location != NSNotFound ? nsLine.substring(with: match.range(at: 2)) : ""
                 let totalStr = match.range(at: 3).location != NSNotFound ? nsLine.substring(with: match.range(at: 3)) : ""
                 let pctStr = match.range(at: 4).location != NSNotFound ? nsLine.substring(with: match.range(at: 4)) : ""
                 let cnStr = match.range(at: 5).location != NSNotFound ? nsLine.substring(with: match.range(at: 5)) : ""
                 let speedStr = match.range(at: 6).location != NSNotFound ? nsLine.substring(with: match.range(at: 6)) : ""
+
+                // Only transition to downloading when real data is flowing or file allocated
+                if !totalStr.isEmpty && totalStr != "0B" && !line.contains("[METADATA]") {
+                    if task.status != .downloading {
+                        task.status = .downloading
+                    }
+                }
 
                 if let pct = Double(pctStr) {
                     task.progress = pct / 100.0
