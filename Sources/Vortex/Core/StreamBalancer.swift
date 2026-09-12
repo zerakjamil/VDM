@@ -61,7 +61,6 @@ public final class StreamBalancer {
 
         guard !speeds.isEmpty else { return }
         let totalSpeed = speeds.values.reduce(0, +)
-        let avgSpeed = totalSpeed / Double(speeds.count)
 
         // Track peak speed to detect ISP / CDN quota drops (e.g. 15 MB/s dropping to 3.x MB/s)
         if totalSpeed > peakSpeed {
@@ -71,7 +70,7 @@ public final class StreamBalancer {
         // Connection-wide quota throttling detection:
         // If speed previously reached high speeds (> 6.5 MB/s) and has now collapsed to < 3.8 MB/s
         // for 14+ seconds, automatically recycle TCP connections to break server/ISP bandwidth shaping.
-        if peakSpeed >= 6.5 * 1024 * 1024 && totalSpeed < 3.8 * 1024 * 1024 && now.timeIntervalSince(lastRecycleTime) > 30.0 {
+        if peakSpeed >= 6.5 * 1024 * 1024 && totalSpeed < 3.8 * 1024 * 1024 && now.timeIntervalSince(lastRecycleTime) > 45.0 {
             throttledSeconds += 2
             if throttledSeconds >= 14 {
                 print("[StreamBalancer] Quota throttling detected: speed collapsed from \(String(format: "%.1f", peakSpeed / 1024 / 1024)) MB/s to \(String(format: "%.1f", totalSpeed / 1024 / 1024)) MB/s. Recycling TCP connections...")
@@ -84,20 +83,21 @@ public final class StreamBalancer {
             throttledSeconds = 0
         }
 
-        // Detect choking: speed < 25% of average or stalled
+        // Detect truly stalled connections (< 10 KB/s for 16+ seconds with > 15MB remaining)
         for seg in activeSegments {
             let speed = speeds[seg.id] ?? 0
-            if speed < (avgSpeed * 0.25) && seg.remainingBytes > 10 * 1024 * 1024 {
+            if speed < 10 * 1024 && seg.remainingBytes > 15 * 1024 * 1024 {
                 stalledSeconds[seg.id, default: 0] += 2
             } else {
                 stalledSeconds[seg.id] = 0
             }
 
-            // If choked for 4+ seconds and has significant bytes left, trigger dynamic boost/split
-            if (stalledSeconds[seg.id] ?? 0) >= 4 {
+            // If stalled for 16+ seconds, trigger dynamic boost/split up to 32 streams
+            if (stalledSeconds[seg.id] ?? 0) >= 16 {
                 stalledSeconds[seg.id] = 0
-                if task.segments.count < 64 {
-                    task.boostStreams(targetCount: min(64, task.segments.count + 4))
+                if task.segments.count < 32 && now.timeIntervalSince(lastRecycleTime) > 45.0 {
+                    lastRecycleTime = now
+                    task.boostStreams(targetCount: min(32, task.segments.count + 4))
                     break
                 }
             }

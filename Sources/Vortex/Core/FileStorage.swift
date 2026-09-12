@@ -142,4 +142,44 @@ public final class FileStorage: @unchecked Sendable {
             fileDescriptor = -1
         }
     }
+
+    /// Verifies physical allocation and completeness on disk.
+    /// Returns true only if the file is physically allocated to match expectedTotalBytes (no sparse holes).
+    public func verifyCompleteness(expectedTotalBytes: Int64) -> (complete: Bool, allocatedBytes: Int64) {
+        guard expectedTotalBytes > 0 else { return (true, 0) }
+
+        var statBuf = stat()
+        let res: Int32
+        lock.lock()
+        if fileDescriptor >= 0 {
+            res = fstat(fileDescriptor, &statBuf)
+        } else {
+            res = stat(filePath, &statBuf)
+        }
+        lock.unlock()
+
+        guard res == 0 else {
+            return (false, 0)
+        }
+
+        if statBuf.st_size < off_t(expectedTotalBytes) {
+            return (false, Int64(statBuf.st_blocks) * 512)
+        }
+
+        let allocated = Int64(statBuf.st_blocks) * 512
+        let threshold = max(0, expectedTotalBytes - 65536)
+        return (allocated >= threshold, allocated)
+    }
+
+    public static func verifyFileCompleteness(filePath: String, expectedTotalBytes: Int64) -> (complete: Bool, allocatedBytes: Int64) {
+        guard expectedTotalBytes > 0 else { return (true, 0) }
+        var statBuf = stat()
+        guard stat(filePath, &statBuf) == 0 else { return (false, 0) }
+        if statBuf.st_size < off_t(expectedTotalBytes) {
+            return (false, Int64(statBuf.st_blocks) * 512)
+        }
+        let allocated = Int64(statBuf.st_blocks) * 512
+        let threshold = max(0, expectedTotalBytes - 65536)
+        return (allocated >= threshold, allocated)
+    }
 }

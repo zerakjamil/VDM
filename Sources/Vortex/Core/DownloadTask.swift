@@ -69,7 +69,13 @@ public final class DownloadTask: ObservableObject, Identifiable {
 
     public init(metadata: DownloadMetadata) {
         self.id = metadata.id
-        self.url = URL(string: metadata.url)!
+        if let parsedUrl = URL(string: metadata.url) {
+            self.url = parsedUrl
+        } else if let encoded = metadata.url.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed), let parsedUrl = URL(string: encoded) {
+            self.url = parsedUrl
+        } else {
+            self.url = URL(fileURLWithPath: "/")
+        }
         if let original = metadata.originalPageUrl {
             self.originalPageUrl = URL(string: original)
         }
@@ -86,21 +92,21 @@ public final class DownloadTask: ObservableObject, Identifiable {
         let tempPath = metadata.destinationPath + ".vortex"
         let finalPath = metadata.destinationPath
 
-        // Verify file presence and alignment on disk
-        if metadata.status == .completed && fm.fileExists(atPath: finalPath) {
+        // Verify physical completeness on disk (guarantees no sparse zero-holes)
+        let (isFinalComplete, _) = FileStorage.verifyFileCompleteness(filePath: finalPath, expectedTotalBytes: metadata.totalBytes)
+
+        if isFinalComplete && fm.fileExists(atPath: finalPath) {
             self.status = .completed
-        } else if fm.fileExists(atPath: finalPath) && !fm.fileExists(atPath: tempPath) && metadata.totalBytes > 0 {
-            if let attrs = try? fm.attributesOfItem(atPath: finalPath),
-               let size = attrs[.size] as? Int64, size >= metadata.totalBytes {
-                self.status = .completed
-            } else {
-                self.status = metadata.status == .downloading ? .paused : metadata.status
-            }
         } else {
-            self.status = metadata.status == .downloading ? .paused : metadata.status
+            // File is incomplete on disk!
+            if fm.fileExists(atPath: finalPath) && !fm.fileExists(atPath: tempPath) {
+                // If it was prematurely renamed to finalPath, move it back to .vortex so download can resume!
+                try? fm.moveItem(atPath: finalPath, toPath: tempPath)
+            }
+            self.status = metadata.status == .downloading ? .paused : (metadata.status == .completed ? .paused : metadata.status)
         }
 
-        // Align segment offsets with actual size of .vortex file on disk
+        // Align segment offsets with actual size and physical completeness of .vortex file on disk
         var validatedSegments = metadata.segments
         if fm.fileExists(atPath: tempPath), let attrs = try? fm.attributesOfItem(atPath: tempPath), let fileSize = attrs[.size] as? Int64 {
             if fileSize < metadata.totalBytes {
@@ -114,6 +120,18 @@ public final class DownloadTask: ObservableObject, Identifiable {
                     }
                     return s
                 }
+            }
+        }
+
+        let (isTempComplete, _) = FileStorage.verifyFileCompleteness(filePath: tempPath, expectedTotalBytes: metadata.totalBytes)
+        if !isTempComplete && !validatedSegments.isEmpty {
+            // Strictly preserve all existing segment progress! Only mark unreached segments as pending
+            validatedSegments = validatedSegments.map { seg in
+                var s = seg
+                if s.currentOffset <= s.endOffset {
+                    s.state = .pending
+                }
+                return s
             }
         }
         self.segments = validatedSegments
@@ -161,8 +179,10 @@ public final class DownloadTask: ObservableObject, Identifiable {
     }
 
     private func startDownloadCoordinator() {
+        let oldCoordinator = coordinatorTask
         coordinatorTask = Task { [weak self] in
-            guard let self = self else { return }
+            _ = await oldCoordinator?.result
+            guard let self = self, !Task.isCancelled else { return }
             var reconnectAttempt = 0
             let maxReconnectAttempts = 60 // Can sustain long router reboots / internet outages
 
@@ -467,45 +487,14 @@ public final class DownloadTask: ObservableObject, Identifiable {
             let pendingSegments = self.segments.filter { !$0.isFinished }
             if pendingSegments.isEmpty { break }
 
+            let maxConcurrentStreams = 24
             try await withThrowingTaskGroup(of: (Int, Error?).self) { group in
-                for segment in pendingSegments {
-                    let assignedUrl = allUrls[segment.id % allUrls.count]
-                    let useProxy = (proxyConfig != nil && (segment.id % 2 == 1))
-                    let assignedProxy = useProxy ? proxyConfig : nil
+                var iterator = pendingSegments.makeIterator()
+                var activeCount = 0
 
-                    let worker = SegmentWorker(
-                        segmentId: segment.id,
-                        startOffset: segment.startOffset,
-                        currentOffset: segment.currentOffset,
-                        endOffset: segment.endOffset,
-                        storage: fileStorage,
-                        customHeaders: self.customHeaders,
-                        proxyConfig: assignedProxy
-                    ) { [weak self] (segId, bytesDelta, newOffset) in
-                        Task { @MainActor [weak self] in
-                            self?.updateProgress(segmentId: segId, bytesDelta: bytesDelta, newOffset: newOffset)
-                        }
-                    }
-
-                    self.workers[segment.id] = worker
-                    let primaryUrl = self.url
-
-                    group.addTask {
-                        do {
-                            try await worker.execute(url: assignedUrl)
-                            return (segment.id, nil)
-                        } catch {
-                            if assignedUrl != primaryUrl {
-                                do {
-                                    try await worker.execute(url: primaryUrl)
-                                    return (segment.id, nil)
-                                } catch let fallbackErr {
-                                    return (segment.id, fallbackErr)
-                                }
-                            }
-                            return (segment.id, error)
-                        }
-                    }
+                while activeCount < maxConcurrentStreams, let segment = iterator.next() {
+                    self.spawnWorkerTask(for: segment, in: &group, allUrls: allUrls, fileStorage: fileStorage, proxyConfig: proxyConfig)
+                    activeCount += 1
                 }
 
                 for try await (segId, error) in group {
@@ -520,6 +509,10 @@ public final class DownloadTask: ObservableObject, Identifiable {
                         }
                         self.workers.removeValue(forKey: segId)
                     }
+
+                    if let nextSegment = iterator.next() {
+                        self.spawnWorkerTask(for: nextSegment, in: &group, allUrls: allUrls, fileStorage: fileStorage, proxyConfig: proxyConfig)
+                    }
                 }
             }
         }
@@ -530,8 +523,33 @@ public final class DownloadTask: ObservableObject, Identifiable {
             throw SegmentError.networkError("Download ended prematurely: not all segments finished")
         }
 
-        // All segments finished! Flush & close storage
+        // All segments finished! Flush storage
         storage?.flush()
+
+        // Physical disk verification: strictly verify zero sparse holes and full block allocation
+        if totalBytes > 0, let st = storage {
+            let (isPhysicallyComplete, allocated) = st.verifyCompleteness(expectedTotalBytes: totalBytes)
+            if !isPhysicallyComplete {
+                print("[DownloadTask] Physical verification failed: expected \(totalBytes) bytes, but only \(allocated) bytes allocated on disk. Preserving progress and resuming remaining missing ranges...")
+                await MainActor.run {
+                    self.segments = self.segments.map { seg in
+                        var s = seg
+                        if s.currentOffset <= s.endOffset {
+                            s.state = .pending
+                        }
+                        return s
+                    }
+                    let downloaded = self.segments.reduce(0) { $0 + $1.bytesDownloaded }
+                    self.downloadedBytes = min(self.totalBytes, downloaded)
+                    if self.totalBytes > 0 {
+                        self.progress = min(1.0, Double(self.downloadedBytes) / Double(self.totalBytes))
+                    }
+                }
+                saveMetadata()
+                throw SegmentError.networkError("File has sparse unallocated regions on disk (\(SpeedTracker.formatBytes(allocated)) of \(SpeedTracker.formatBytes(totalBytes))). Resuming missing byte ranges.")
+            }
+        }
+
         storage?.close()
         storage = nil
 
@@ -560,6 +578,52 @@ public final class DownloadTask: ObservableObject, Identifiable {
         status = .completed
         cleanupAfterStop()
         saveMetadata()
+    }
+
+    private func spawnWorkerTask(
+        for segment: SegmentInfo,
+        in group: inout ThrowingTaskGroup<(Int, Error?), Error>,
+        allUrls: [URL],
+        fileStorage: FileStorage,
+        proxyConfig: ProxyConfiguration?
+    ) {
+        let assignedUrl = allUrls[segment.id % allUrls.count]
+        let useProxy = (proxyConfig != nil && (segment.id % 2 == 1))
+        let assignedProxy = useProxy ? proxyConfig : nil
+
+        let worker = SegmentWorker(
+            segmentId: segment.id,
+            startOffset: segment.startOffset,
+            currentOffset: segment.currentOffset,
+            endOffset: segment.endOffset,
+            storage: fileStorage,
+            customHeaders: self.customHeaders,
+            proxyConfig: assignedProxy
+        ) { [weak self] (segId, bytesDelta, newOffset) in
+            Task { @MainActor [weak self] in
+                self?.updateProgress(segmentId: segId, bytesDelta: bytesDelta, newOffset: newOffset)
+            }
+        }
+
+        self.workers[segment.id] = worker
+        let primaryUrl = self.url
+
+        group.addTask {
+            do {
+                try await worker.execute(url: assignedUrl)
+                return (segment.id, nil)
+            } catch {
+                if assignedUrl != primaryUrl {
+                    do {
+                        try await worker.execute(url: primaryUrl)
+                        return (segment.id, nil)
+                    } catch let fallbackErr {
+                        return (segment.id, fallbackErr)
+                    }
+                }
+                return (segment.id, error)
+            }
+        }
     }
 
     /// Dynamic splitting: if a worker finished early and another has > 40MB remaining, split it!
@@ -591,23 +655,24 @@ public final class DownloadTask: ObservableObject, Identifiable {
         recycleConnections()
     }
 
-    /// On-the-fly stream booster: multiply active connections up to targetCount (16x / 24x / 32x / 48x / 64x)
-    public func boostStreams(targetCount: Int = 48) {
+    /// On-the-fly stream booster: multiply active connections up to targetCount (up to 32)
+    public func boostStreams(targetCount: Int = 32) {
         guard supportsRange, totalBytes > 10 * 1024 * 1024, isDownloading else { return }
+        let effectiveTarget = min(32, targetCount)
 
         var iterations = 0
         var didSplit = false
-        while segments.filter({ !$0.isFinished }).count < targetCount && iterations < 64 {
+        while segments.filter({ !$0.isFinished }).count < effectiveTarget && iterations < 32 {
             iterations += 1
             guard let largestIndex = segments.enumerated()
-                .filter({ !$0.element.isFinished && $0.element.remainingBytes > 4 * 1024 * 1024 })
+                .filter({ !$0.element.isFinished && $0.element.remainingBytes > 10 * 1024 * 1024 })
                 .max(by: { $0.element.remainingBytes < $1.element.remainingBytes })?.offset else {
                 break
             }
 
             let largest = segments[largestIndex]
             let mid = largest.currentOffset + (largest.remainingBytes / 2)
-            guard mid < largest.endOffset - (1024 * 1024) else { break }
+            guard mid < largest.endOffset - (2 * 1024 * 1024) else { break }
 
             if let worker = workers[largest.id] {
                 worker.cancel()
@@ -635,7 +700,9 @@ public final class DownloadTask: ObservableObject, Identifiable {
     public func recycleConnections() {
         guard isDownloading, supportsRange else { return }
 
-        coordinatorTask?.cancel()
+        let oldCoordinator = coordinatorTask
+        oldCoordinator?.cancel()
+
         for (_, worker) in workers {
             worker.cancel()
         }

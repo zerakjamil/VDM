@@ -583,5 +583,46 @@ final class VortexTests: XCTestCase {
         let diskSize = attrs[.size] as? Int64 ?? 0
         XCTAssertGreaterThanOrEqual(diskSize, Int64(chunk.count))
     }
+
+    func testSegmentWorkerCancellationThreadSafety() async throws {
+        let tempDir = FileManager.default.temporaryDirectory
+        let filePath = tempDir.appendingPathComponent("TestThreadSafety_\(UUID().uuidString).bin").path
+        let storage = FileStorage(filePath: filePath)
+        try storage.prepareFile(totalSize: 4096)
+        defer {
+            storage.close()
+            try? FileManager.default.removeItem(atPath: filePath)
+        }
+
+        // Run 50 concurrent cancel/completion races on SegmentWorker
+        for i in 0..<50 {
+            let worker = SegmentWorker(
+                segmentId: i,
+                startOffset: 0,
+                currentOffset: 0,
+                endOffset: 4095,
+                storage: storage
+            ) { _, _, _ in }
+
+            let executeTask = Task {
+                do {
+                    try await worker.execute(url: URL(string: "http://127.0.0.1:17899/test")!)
+                } catch {
+                    // Expected to throw cancellation or network error
+                }
+            }
+
+            // Simultaneously invoke cancel and completion from multiple concurrent tasks
+            let t1 = Task { worker.cancel() }
+            let t2 = Task { worker.cancel() }
+            let t3 = Task {
+                let dummySession = URLSession.shared
+                let dummyTask = dummySession.dataTask(with: URL(string: "https://example.com")!)
+                worker.urlSession(dummySession, task: dummyTask, didCompleteWithError: NSError(domain: NSURLErrorDomain, code: NSURLErrorCancelled))
+            }
+
+            _ = await (t1.value, t2.value, t3.value, executeTask.value)
+        }
+    }
 }
 

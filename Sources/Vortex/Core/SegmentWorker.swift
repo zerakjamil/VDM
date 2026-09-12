@@ -35,6 +35,55 @@ public struct ProxyConfiguration: Sendable {
     }
 }
 
+/// Thread-safe gate ensuring a CheckedContinuation is resolved AT MOST ONCE.
+private final class ContinuationGate: @unchecked Sendable {
+    private var continuation: CheckedContinuation<Void, Error>?
+    private let lock = NSLock()
+    private var isResolved = false
+
+    func setContinuation(_ cont: CheckedContinuation<Void, Error>) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if isResolved {
+            return false
+        }
+        self.continuation = cont
+        return true
+    }
+
+    func resume() {
+        lock.lock()
+        guard !isResolved, let cont = continuation else {
+            isResolved = true
+            continuation = nil
+            lock.unlock()
+            return
+        }
+        isResolved = true
+        continuation = nil
+        lock.unlock()
+        cont.resume()
+    }
+
+    func resume(throwing error: Error) {
+        lock.lock()
+        guard !isResolved, let cont = continuation else {
+            isResolved = true
+            continuation = nil
+            lock.unlock()
+            return
+        }
+        isResolved = true
+        continuation = nil
+        lock.unlock()
+        cont.resume(throwing: error)
+    }
+
+    func cancel() {
+        resume(throwing: SegmentError.cancelled)
+    }
+}
+
 public final class SegmentWorker: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     public let segmentId: Int
     public let startOffset: Int64
@@ -46,17 +95,18 @@ public final class SegmentWorker: NSObject, URLSessionDataDelegate, @unchecked S
     private var proxyConfig: ProxyConfiguration?
     private var session: URLSession?
     private var dataTask: URLSessionDataTask?
-    private var continuation: CheckedContinuation<Void, Error>?
+    private var activeGate: ContinuationGate?
+    private let stateLock = NSLock()
 
     private let onProgress: @Sendable (Int, Int64, Int64) -> Void // (segmentId, bytesDelta, newCurrentOffset)
     private var isCancelled = false
     private var pendingBytesDelta: Int64 = 0
     private var lastReportTime: CFAbsoluteTime = 0
 
-    // High-Performance Batched Disk I/O Buffer (Eliminates exFAT/APFS lock contention)
+    // High-Performance Batched Disk I/O Buffer (Eliminates lock contention while ensuring tight disk sync)
     private var writeBuffer = Data()
     private var writeBufferStartOffset: Int64 = -1
-    private let writeBufferThreshold = 512 * 1024 // 512 KB aligned batch
+    private let writeBufferThreshold = 64 * 1024 // 64 KB fast-commit batch
     private let bufferLock = NSLock()
 
     public init(
@@ -87,25 +137,31 @@ public final class SegmentWorker: NSObject, URLSessionDataDelegate, @unchecked S
 
         var attempt = 0
         while attempt < maxRetries {
-            if isCancelled { throw SegmentError.cancelled }
+            let cancelled = stateLock.withLock { isCancelled }
+            if cancelled { throw SegmentError.cancelled }
+
             do {
                 try await downloadAttempt(url: url)
                 try? flushBuffer()
                 return // Finished successfully
             } catch let err as SegmentError {
-                // If link expired, do not retry blindly: throw immediately to trigger Link Renewal!
                 if case .linkExpired = err {
                     throw err
                 }
+                if case .cancelled = err {
+                    throw err
+                }
                 attempt += 1
-                if attempt >= maxRetries || isCancelled {
+                let nowCancelled = stateLock.withLock { isCancelled }
+                if attempt >= maxRetries || nowCancelled {
                     throw err
                 }
                 // Exponential backoff
                 let backoff = Double(attempt) * 1.5
                 try await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
             } catch {
-                if isCancelled { throw SegmentError.cancelled }
+                let nowCancelled = stateLock.withLock { isCancelled }
+                if nowCancelled { throw SegmentError.cancelled }
                 attempt += 1
                 if attempt >= maxRetries {
                     throw SegmentError.networkError(error.localizedDescription)
@@ -117,56 +173,94 @@ public final class SegmentWorker: NSObject, URLSessionDataDelegate, @unchecked S
     }
 
     private func downloadAttempt(url: URL) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            self.continuation = continuation
+        let gate = ContinuationGate()
+        let cancelled = stateLock.withLock { () -> Bool in
+            if isCancelled { return true }
+            self.activeGate = gate
+            return false
+        }
+        if cancelled { throw SegmentError.cancelled }
 
-            let config = URLSessionConfiguration.ephemeral
-            config.timeoutIntervalForRequest = 30.0
-            config.timeoutIntervalForResource = 3600.0
-            config.httpMaximumConnectionsPerHost = 128
-            config.httpShouldUsePipelining = false
-
-            if let proxy = self.proxyConfig {
-                if proxy.isSocks {
-                    config.connectionProxyDictionary = [
-                        kCFNetworkProxiesSOCKSEnable as String: 1,
-                        kCFNetworkProxiesSOCKSProxy as String: proxy.host,
-                        kCFNetworkProxiesSOCKSPort as String: proxy.port
-                    ]
-                } else {
-                    config.connectionProxyDictionary = [
-                        kCFNetworkProxiesHTTPEnable as String: 1,
-                        kCFNetworkProxiesHTTPProxy as String: proxy.host,
-                        kCFNetworkProxiesHTTPPort as String: proxy.port
-                    ]
+        defer {
+            let sess = stateLock.withLock { () -> URLSession? in
+                let s = self.session
+                self.session = nil
+                self.dataTask = nil
+                if self.activeGate === gate {
+                    self.activeGate = nil
                 }
+                return s
             }
+            sess?.invalidateAndCancel()
+        }
 
-            let opQueue = OperationQueue()
-            opQueue.maxConcurrentOperationCount = 1
-            let session = URLSession(configuration: config, delegate: self, delegateQueue: opQueue)
-            self.session = session
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                if !gate.setContinuation(continuation) {
+                    continuation.resume(throwing: SegmentError.cancelled)
+                    return
+                }
 
-            var request = URLRequest(url: url)
-            request.httpMethod = "GET"
-            request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+                let shouldCancel = stateLock.withLock { self.isCancelled }
+                if shouldCancel {
+                    gate.cancel()
+                    return
+                }
 
-            // Set Range header for partial content
-            let rangeHeader = (endOffset >= Int64.max - 1000) ? "bytes=\(currentOffset)-" : "bytes=\(currentOffset)-\(endOffset)"
-            request.setValue(rangeHeader, forHTTPHeaderField: "Range")
+                let config = URLSessionConfiguration.ephemeral
+                config.timeoutIntervalForRequest = 30.0
+                config.timeoutIntervalForResource = 3600.0
+                config.httpMaximumConnectionsPerHost = 128
+                config.httpShouldUsePipelining = false
 
-            // Default standard Chrome user-agent if not provided
-            if customHeaders["User-Agent"] == nil {
-                request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
+                if let proxy = self.proxyConfig {
+                    if proxy.isSocks {
+                        config.connectionProxyDictionary = [
+                            kCFNetworkProxiesSOCKSEnable as String: 1,
+                            kCFNetworkProxiesSOCKSProxy as String: proxy.host,
+                            kCFNetworkProxiesSOCKSPort as String: proxy.port
+                        ]
+                    } else {
+                        config.connectionProxyDictionary = [
+                            kCFNetworkProxiesHTTPEnable as String: 1,
+                            kCFNetworkProxiesHTTPProxy as String: proxy.host,
+                            kCFNetworkProxiesHTTPPort as String: proxy.port
+                        ]
+                    }
+                }
+
+                let opQueue = OperationQueue()
+                opQueue.maxConcurrentOperationCount = 1
+                let session = URLSession(configuration: config, delegate: self, delegateQueue: opQueue)
+
+                var request = URLRequest(url: url)
+                request.httpMethod = "GET"
+                request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+
+                // Set Range header for partial content
+                let rangeHeader = (self.endOffset >= Int64.max - 1000) ? "bytes=\(self.currentOffset)-" : "bytes=\(self.currentOffset)-\(self.endOffset)"
+                request.setValue(rangeHeader, forHTTPHeaderField: "Range")
+
+                // Default standard Chrome user-agent if not provided
+                if self.customHeaders["User-Agent"] == nil {
+                    request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
+                }
+
+                for (key, value) in self.customHeaders {
+                    request.setValue(value, forHTTPHeaderField: key)
+                }
+
+                let task = session.dataTask(with: request)
+                stateLock.withLock {
+                    self.session = session
+                    self.dataTask = task
+                }
+
+                task.resume()
             }
-
-            for (key, value) in customHeaders {
-                request.setValue(value, forHTTPHeaderField: key)
-            }
-
-            let task = session.dataTask(with: request)
-            self.dataTask = task
-            task.resume()
+        } onCancel: {
+            gate.cancel()
+            self.cancel()
         }
     }
 
@@ -186,22 +280,34 @@ public final class SegmentWorker: NSObject, URLSessionDataDelegate, @unchecked S
     }
 
     public func cancel() {
-        isCancelled = true
-        dataTask?.cancel()
-        session?.invalidateAndCancel()
-        try? flushBuffer()
-        if let cont = continuation {
-            continuation = nil
-            cont.resume(throwing: SegmentError.cancelled)
+        let (task, sess, gate) = stateLock.withLock { () -> (URLSessionDataTask?, URLSession?, ContinuationGate?) in
+            self.isCancelled = true
+            let t = self.dataTask
+            let s = self.session
+            let g = self.activeGate
+            self.dataTask = nil
+            self.session = nil
+            return (t, s, g)
         }
+
+        task?.cancel()
+        sess?.invalidateAndCancel()
+        try? flushBuffer()
+
+        gate?.cancel()
     }
 
     // MARK: - URLSessionDataDelegate
 
     public func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        let (gate, isMatch) = stateLock.withLock { (self.activeGate, self.session == nil || session === self.session) }
+        guard let gate = gate, isMatch else {
+            completionHandler(.cancel)
+            return
+        }
+
         guard let http = response as? HTTPURLResponse else {
-            continuation?.resume(throwing: SegmentError.networkError("Invalid non-HTTP response"))
-            continuation = nil
+            gate.resume(throwing: SegmentError.networkError("Invalid non-HTTP response"))
             completionHandler(.cancel)
             return
         }
@@ -209,23 +315,20 @@ public final class SegmentWorker: NSObject, URLSessionDataDelegate, @unchecked S
         // Detect expired links / token timeout
         if http.statusCode == 401 || http.statusCode == 403 || http.statusCode == 410 {
             let msg = HTTPURLResponse.localizedString(forStatusCode: http.statusCode)
-            continuation?.resume(throwing: SegmentError.linkExpired(statusCode: http.statusCode, message: msg))
-            continuation = nil
+            gate.resume(throwing: SegmentError.linkExpired(statusCode: http.statusCode, message: msg))
             completionHandler(.cancel)
             return
         }
 
         // 206 Partial Content is expected. 200 OK means server ignored range header.
         if http.statusCode == 200 && currentOffset > 0 {
-            continuation?.resume(throwing: SegmentError.serverDoesNotSupportRange)
-            continuation = nil
+            gate.resume(throwing: SegmentError.serverDoesNotSupportRange)
             completionHandler(.cancel)
             return
         }
 
         if http.statusCode != 206 && http.statusCode != 200 {
-            continuation?.resume(throwing: SegmentError.invalidResponse(statusCode: http.statusCode))
-            continuation = nil
+            gate.resume(throwing: SegmentError.invalidResponse(statusCode: http.statusCode))
             completionHandler(.cancel)
             return
         }
@@ -234,7 +337,8 @@ public final class SegmentWorker: NSObject, URLSessionDataDelegate, @unchecked S
     }
 
     public func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        guard !isCancelled else { return }
+        let cancelled = stateLock.withLock { self.isCancelled }
+        guard !cancelled else { return }
 
         // Strictly prevent writing past endOffset if server ignores range or streams beyond boundary
         var writeData = data
@@ -284,8 +388,8 @@ public final class SegmentWorker: NSObject, URLSessionDataDelegate, @unchecked S
                 onProgress(segmentId, delta, currentOffset)
             }
         } catch {
-            continuation?.resume(throwing: error)
-            continuation = nil
+            let gate = stateLock.withLock { self.activeGate }
+            gate?.resume(throwing: error)
             dataTask.cancel()
         }
     }
@@ -299,25 +403,34 @@ public final class SegmentWorker: NSObject, URLSessionDataDelegate, @unchecked S
             onProgress(segmentId, delta, currentOffset)
         }
 
-        guard let cont = continuation else { return }
-        self.continuation = nil
+        let (gate, isMatch, cancelled) = stateLock.withLock {
+            (self.activeGate, self.session == nil || session === self.session, self.isCancelled)
+        }
+        guard let gate = gate, isMatch else {
+            return
+        }
+
+        if cancelled {
+            gate.cancel()
+            return
+        }
 
         if let error = error {
             if (error as NSError).code == NSURLErrorCancelled {
-                cont.resume(throwing: SegmentError.cancelled)
+                gate.cancel()
             } else {
-                cont.resume(throwing: error)
+                gate.resume(throwing: error)
             }
         } else {
             // Normal EOF from server
             // Check if this segment had a fixed endOffset that was NOT reached:
             if endOffset < Int64.max - 1000 && currentOffset <= endOffset {
                 let missing = (endOffset + 1) - currentOffset
-                cont.resume(throwing: SegmentError.networkError("Connection closed prematurely by server (\(missing) bytes remaining)"))
+                gate.resume(throwing: SegmentError.networkError("Connection closed prematurely by server (\(missing) bytes remaining)"))
             } else if currentOffset <= 1 && endOffset >= Int64.max - 1000 {
-                cont.resume(throwing: SegmentError.networkError("Connection closed before any data was received"))
+                gate.resume(throwing: SegmentError.networkError("Connection closed before any data was received"))
             } else {
-                cont.resume()
+                gate.resume()
             }
         }
     }
